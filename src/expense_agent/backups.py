@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 
 class BackupService:
@@ -24,7 +24,7 @@ class BackupService:
             path.unlink()
 
 
-def make_drive_exporter(drive_service: object) -> Callable[[str], bytes]:
+def make_drive_exporter(drive_service: Any) -> Callable[[str], bytes]:
     def export(spreadsheet_id: str) -> bytes:
         request = drive_service.files().export_media(
             fileId=spreadsheet_id,
@@ -33,4 +33,3 @@ def make_drive_exporter(drive_service: object) -> Callable[[str], bytes]:
         return bytes(request.execute())
 
     return export
-

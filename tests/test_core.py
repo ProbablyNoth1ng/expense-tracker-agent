@@ -150,6 +150,8 @@ class CategorizationTests(unittest.TestCase):
             ("Battle . net", games),
             ("Blizzard Entertainment", games),
             ("EA.COM", games),
+            ("EA Games Store", games),
+            ("EA.COM FIFA", games),
             ("UBISOFT STORE", games),
             ("Riot-Game Store", games),
             ("Xbox Game Pass", subscriptions),
@@ -192,6 +194,46 @@ class CategorizationTests(unittest.TestCase):
                     "Кафе и рестораны",
                 )
         self.assertEqual(model.classify.call_count, 2)
+
+    def test_builtin_merchant_rules_do_not_match_compact_substrings(self):
+        store = Mock()
+        store.find_merchant_rule.return_value = None
+        model = Mock()
+        expected = CategoryDecision(CATEGORIES[0], 0.9, "model result")
+        model.classify.return_value = expected
+        categorizer = Categorizer(store=store, model=model)
+
+        for merchant in ("GOGO Sushi", "The Best Coffee"):
+            with self.subTest(merchant=merchant):
+                self.assertEqual(categorizer.categorize(merchant, 9999, 50.0), expected)
+
+        self.assertEqual(model.classify.call_count, 2)
+
+    def test_builtin_merchant_rules_match_bounded_ea_and_riot_variants(self):
+        store = Mock()
+        store.find_merchant_rule.return_value = None
+        model = Mock()
+        categorizer = Categorizer(store=store, model=model)
+
+        for merchant in ("Riot Games", "RIOTGAMES", "EAGAMES", "EASPORTS", "EACOM"):
+            with self.subTest(merchant=merchant):
+                self.assertEqual(categorizer.categorize(merchant, 9999, 50.0).category, CATEGORIES[-1])
+
+        model.classify.assert_not_called()
+
+    def test_builtin_merchant_rules_keep_lookalikes_as_model_candidates(self):
+        store = Mock()
+        store.find_merchant_rule.return_value = None
+        model = Mock()
+        expected = CategoryDecision(CATEGORIES[6], 0.9, "model result")
+        model.classify.return_value = expected
+        categorizer = Categorizer(store=store, model=model)
+
+        for merchant in ("GOGO Sushi", "The Best Coffee", "EasyJet", "Eataly"):
+            with self.subTest(merchant=merchant):
+                self.assertEqual(categorizer.categorize(merchant, 9999, 50.0), expected)
+
+        self.assertEqual(model.classify.call_count, 4)
 
     def test_builtin_merchant_rule_wins_over_learned_rule(self):
         store = Mock()
@@ -243,6 +285,17 @@ class CategorizationTests(unittest.TestCase):
                 model.classify.return_value = decision
                 result = categorizer.categorize("Ambiguous", 9999, 50.0)
                 self.assertEqual(result.category, "Прочее")
+                self.assertEqual(result.confidence, 0.0)
+    def test_model_non_finite_or_out_of_range_confidence_falls_back_to_other(self):
+        store = Mock()
+        store.find_merchant_rule.return_value = None
+        model = Mock()
+        categorizer = Categorizer(store=store, model=model)
+        for confidence in (float("nan"), float("inf"), -0.1, 1.1):
+            with self.subTest(confidence=confidence):
+                model.classify.return_value = CategoryDecision(CATEGORIES[0], confidence, "invalid confidence")
+                result = categorizer.categorize("Ambiguous", 9999, 50.0)
+                self.assertEqual(result.category, CATEGORIES[-4])
                 self.assertEqual(result.confidence, 0.0)
 
 

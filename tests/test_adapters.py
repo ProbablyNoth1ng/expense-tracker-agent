@@ -7,7 +7,7 @@ from unittest.mock import Mock
 from expense_agent.backups import BackupService
 from expense_agent.models import ChangeProposal
 from expense_agent.monobank import MonobankClient, statement_windows
-from expense_agent.constants import MONTH_SHEETS
+from expense_agent.constants import CATEGORIES, MONTH_SHEETS
 from expense_agent.sheets import (
     REVIEW_HEADERS,
     SheetsGateway,
@@ -46,6 +46,223 @@ class MonobankTests(unittest.TestCase):
 
 
 class SheetsTests(unittest.TestCase):
+    @staticmethod
+    def _migration_metadata(*, total_row: int = 16):
+        sheets = []
+        for sheet_id, title in enumerate(MONTH_SHEETS.values(), start=2):
+            sheets.append({
+                "properties": {"title": title, "sheetId": sheet_id},
+                "data": [{
+                    "startRow": total_row - 1,
+                    "startColumn": 5,
+                    "rowData": [{"values": [{"userEnteredValue": {"stringValue": "RAZEM"}}]}],
+                }],
+            })
+        sheets.insert(0, {
+            "properties": {"title": "Podsumowanie", "sheetId": 1},
+            "data": [{
+                "startRow": total_row - 1,
+                "startColumn": 0,
+                "rowData": [{"values": [{"userEnteredValue": {"stringValue": "ŁĄCZNIE"}}]}],
+            }],
+        })
+        sheets.extend([
+            {"properties": {"title": "Review", "sheetId": 20}},
+            {"properties": {"title": "Agent Log", "sheetId": 21}},
+        ])
+        return {"sheets": sheets}
+
+    def _migrate_with_metadata(self, metadata):
+        service = Mock()
+        spreadsheets = service.spreadsheets.return_value
+        spreadsheets.get.return_value.execute.side_effect = [metadata, metadata, metadata]
+        SheetsGateway(service=service, spreadsheet_id="sheet-id").migrate_template()
+        return spreadsheets
+
+    def test_migration_uses_dynamic_category_ranges_and_locale_formulas(self):
+        spreadsheets = self._migrate_with_metadata(self._migration_metadata())
+        value_call = next(
+            call for call in spreadsheets.values.return_value.batchUpdate.call_args_list
+            if "data" in call.kwargs["body"]
+        )
+        updates = value_call.kwargs["body"]["data"]
+        by_range = {update["range"]: update["values"] for update in updates}
+        january = MONTH_SHEETS[1]
+
+        self.assertEqual(by_range[f"'{january}'!F4:F17"], [[category] for category in CATEGORIES])
+        self.assertEqual(
+            by_range[f"'{january}'!G4:G17"],
+            [[f"=IFERROR(SUMIF(B$4:B;F{row};D$4:D);0)"] for row in range(4, 18)],
+        )
+        self.assertEqual(by_range[f"'{january}'!F18:G18"][0][1], "=SUM(G4:G17)")
+        self.assertEqual(by_range["Podsumowanie!A4:A17"], [[category] for category in CATEGORIES])
+        self.assertEqual(
+            by_range["Podsumowanie!B4:N4"][0],
+            [f"=IFERROR('{MONTH_SHEETS[month]}'!G4;0)" for month in range(1, 13)]
+            + ["=SUM(B4:M4)"],
+        )
+        self.assertEqual(
+            by_range["Podsumowanie!A18:N18"][0],
+            ["💰  ŁĄCZNIE W MIESIĄCU"]
+            + [f"=SUM({column}4:{column}17)" for column in "BCDEFGHIJKLM"]
+            + ["=SUM(N4:N17)"],
+        )
+
+        request_call = next(
+            call for call in spreadsheets.batchUpdate.call_args_list
+            if any(
+                "setDataValidation" in request
+                for request in call.kwargs["body"].get("requests", [])
+            )
+        )
+        validations = [
+            request["setDataValidation"] for request in request_call.kwargs["body"]["requests"]
+            if "setDataValidation" in request
+        ]
+        category_values = [{"userEnteredValue": category} for category in CATEGORIES]
+        self.assertEqual(
+            next(item for item in validations if item["range"]["sheetId"] == 2 and item["range"]["startColumnIndex"] == 1)["rule"]["condition"]["values"],
+            category_values,
+        )
+        self.assertEqual(
+            next(item for item in validations if item["range"]["sheetId"] == 20 and item["range"]["startColumnIndex"] == 3)["rule"]["condition"]["values"],
+            category_values,
+        )
+
+    def test_migration_copies_existing_formats_to_new_category_and_total_rows(self):
+        spreadsheets = self._migrate_with_metadata(self._migration_metadata(total_row=16))
+        request_call = next(
+            call for call in spreadsheets.batchUpdate.call_args_list
+            if "requests" in call.kwargs["body"]
+        )
+        copies = [request["copyPaste"] for request in request_call.kwargs["body"]["requests"] if "copyPaste" in request]
+
+        self.assertEqual(len(copies), 39)
+        january_copies = [copy for copy in copies if copy["source"]["sheetId"] == 2]
+        self.assertEqual(
+            january_copies,
+            [
+                {"source": {"sheetId": 2, "startRowIndex": 15, "endRowIndex": 16, "startColumnIndex": 5, "endColumnIndex": 7}, "destination": {"sheetId": 2, "startRowIndex": 17, "endRowIndex": 18, "startColumnIndex": 5, "endColumnIndex": 7}, "pasteType": "PASTE_FORMAT"},
+                {"source": {"sheetId": 2, "startRowIndex": 14, "endRowIndex": 15, "startColumnIndex": 5, "endColumnIndex": 7}, "destination": {"sheetId": 2, "startRowIndex": 15, "endRowIndex": 16, "startColumnIndex": 5, "endColumnIndex": 7}, "pasteType": "PASTE_FORMAT"},
+                {"source": {"sheetId": 2, "startRowIndex": 14, "endRowIndex": 15, "startColumnIndex": 5, "endColumnIndex": 7}, "destination": {"sheetId": 2, "startRowIndex": 16, "endRowIndex": 17, "startColumnIndex": 5, "endColumnIndex": 7}, "pasteType": "PASTE_FORMAT"},
+            ],
+        )
+
+        total_copy_index = next(
+            index for index, copy in enumerate(january_copies)
+            if copy["source"]["startRowIndex"] == 15
+        )
+        source_overwrite_index = next(
+            index for index, copy in enumerate(january_copies)
+            if copy["destination"]["startRowIndex"] == 15
+        )
+        self.assertLess(total_copy_index, source_overwrite_index)
+
+    def test_migration_applies_format_preservation_before_values(self):
+        metadata = self._migration_metadata(total_row=16)
+        service = Mock()
+        spreadsheets = service.spreadsheets.return_value
+        spreadsheets.get.return_value.execute.side_effect = [metadata, metadata, metadata]
+        events = []
+
+        def execute_sheet_batch():
+            requests = spreadsheets.batchUpdate.call_args.kwargs["body"]["requests"]
+            events.append("format" if any("copyPaste" in request for request in requests) else "post")
+
+        spreadsheets.batchUpdate.return_value.execute.side_effect = execute_sheet_batch
+        spreadsheets.values.return_value.batchUpdate.return_value.execute.side_effect = (
+            lambda: events.append("values")
+        )
+
+        SheetsGateway(service=service, spreadsheet_id="sheet-id").migrate_template()
+
+        self.assertEqual(events, ["format", "values", "post"])
+
+    def test_migration_retries_format_preservation_after_values_failure(self):
+        metadata = self._migration_metadata(total_row=16)
+        service = Mock()
+        spreadsheets = service.spreadsheets.return_value
+        spreadsheets.get.return_value.execute.side_effect = [metadata] * 6
+        events = []
+
+        def execute_sheet_batch():
+            requests = spreadsheets.batchUpdate.call_args.kwargs["body"]["requests"]
+            events.append("format" if any("copyPaste" in request for request in requests) else "post")
+
+        def execute_values():
+            if "values-failed" not in events:
+                events.append("values-failed")
+                raise RuntimeError("values unavailable")
+            events.append("values")
+
+        spreadsheets.batchUpdate.return_value.execute.side_effect = execute_sheet_batch
+        spreadsheets.values.return_value.batchUpdate.return_value.execute.side_effect = execute_values
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+
+        with self.assertRaisesRegex(RuntimeError, "values unavailable"):
+            gateway.migrate_template()
+        gateway.migrate_template()
+
+        self.assertEqual(events, ["format", "values-failed", "format", "values", "post"])
+
+    def test_migration_retries_post_requests_without_overwriting_correct_formats(self):
+        legacy = self._migration_metadata(total_row=16)
+        corrected = self._migration_metadata(total_row=18)
+        service = Mock()
+        spreadsheets = service.spreadsheets.return_value
+        spreadsheets.get.return_value.execute.side_effect = [legacy, legacy, legacy, corrected, corrected, corrected]
+        events = []
+
+        def execute_sheet_batch():
+            requests = spreadsheets.batchUpdate.call_args.kwargs["body"]["requests"]
+            if any("copyPaste" in request for request in requests):
+                events.append("format")
+            elif "post-failed" not in events:
+                events.append("post-failed")
+                raise RuntimeError("post migration unavailable")
+            else:
+                events.append("post")
+
+        spreadsheets.batchUpdate.return_value.execute.side_effect = execute_sheet_batch
+        spreadsheets.values.return_value.batchUpdate.return_value.execute.side_effect = (
+            lambda: events.append("values")
+        )
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+
+        with self.assertRaisesRegex(RuntimeError, "post migration unavailable"):
+            gateway.migrate_template()
+        gateway.migrate_template()
+
+        self.assertEqual(events, ["format", "values", "post-failed", "values", "post"])
+
+    def test_migration_reads_only_bounded_category_layout_ranges_for_formats(self):
+        spreadsheets = self._migrate_with_metadata(self._migration_metadata())
+        format_calls = [
+            call for call in spreadsheets.get.call_args_list
+            if "ranges" in call.kwargs
+        ]
+
+        self.assertEqual(len(format_calls), 1)
+        self.assertEqual(
+            format_calls[0].kwargs["ranges"],
+            [
+                *[f"'{title}'!F4:G18" for title in MONTH_SHEETS.values()],
+                "Podsumowanie!A4:N18",
+            ],
+        )
+        self.assertEqual(
+            format_calls[0].kwargs["fields"],
+            "sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values(formattedValue,userEnteredValue))))",
+        )
+
+    def test_migration_skips_format_copies_when_total_is_already_in_target_row(self):
+        spreadsheets = self._migrate_with_metadata(self._migration_metadata(total_row=18))
+        request_call = next(
+            call for call in spreadsheets.batchUpdate.call_args_list
+            if "requests" in call.kwargs["body"]
+        )
+        self.assertFalse(any("copyPaste" in request for request in request_call.kwargs["body"]["requests"]))
+
     def test_template_requires_summary_and_all_months(self):
         titles = ["Podsumowanie", "Styczeń"]
         with self.assertRaisesRegex(ValueError, "missing sheets"):
@@ -123,6 +340,40 @@ class SheetsTests(unittest.TestCase):
 
         spreadsheets.values.return_value.append.assert_called_once()
 
+    def test_approved_add_overwrites_next_table_row_without_shifting_summary(self):
+        service = Mock()
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway.read_review_rows = Mock(
+            return_value=[
+                [
+                    "Approved",
+                    "ADD",
+                    "2026-07-17",
+                    "Еда и продукты",
+                    "Lidl",
+                    12.34,
+                    "monobank",
+                    0.95,
+                    "MCC 5411",
+                    "",
+                    "p1",
+                    "t1",
+                    "fp",
+                    "{}",
+                ]
+            ]
+        )
+
+        result = gateway.apply_approved()
+
+        self.assertEqual(result, {"synced": 1, "conflicts": 0, "errors": 0})
+        monthly_append = next(
+            call
+            for call in service.spreadsheets.return_value.values.return_value.append.call_args_list
+            if call.kwargs["range"] == "'Lipiec'!A4:D"
+        )
+        self.assertEqual(monthly_append.kwargs["insertDataOption"], "OVERWRITE")
+
     def test_chart_ranges_extend_only_eligible_single_columns_from_row_four(self):
         spec = {
             "basicChart": {
@@ -171,6 +422,41 @@ class SheetsTests(unittest.TestCase):
         )
         self.assertEqual([item["endRowIndex"] for item in result["ranges"]], [3, 15, 15])
 
+    def test_chart_ranges_recover_after_transaction_rows_shift_summary(self):
+        spec = {
+            "ranges": [
+                {
+                    "sheetId": 1,
+                    "startRowIndex": 5,
+                    "endRowIndex": 19,
+                    "startColumnIndex": 5,
+                    "endColumnIndex": 6,
+                },
+                {
+                    "sheetId": 1,
+                    "startRowIndex": 5,
+                    "endRowIndex": 19,
+                    "startColumnIndex": 6,
+                    "endColumnIndex": 7,
+                },
+            ]
+        }
+
+        result = extend_chart_ranges(
+            spec,
+            sheet_id=1,
+            category_end_row=17,
+            allowed_columns={5, 6},
+        )
+
+        self.assertEqual(
+            [
+                (item["startRowIndex"], item["endRowIndex"])
+                for item in result["ranges"]
+            ],
+            [(3, 17), (3, 17)],
+        )
+
     def test_migration_updates_only_intended_chart_specs(self):
         summary_horizontal = {"basicChart": {"domains": [{"domain": {"sourceRange": {"sources": [
             {"sheetId": 1, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 0, "endColumnIndex": 13}
@@ -196,6 +482,14 @@ class SheetsTests(unittest.TestCase):
                 {"sheetId": 2, "startRowIndex": 3, "endRowIndex": 34, "startColumnIndex": 8, "endColumnIndex": 9}
             ]}}}],
         }}
+        monthly_shifted_daily = {"basicChart": {
+            "domains": [{"domain": {"sourceRange": {"sources": [
+                {"sheetId": 2, "startRowIndex": 5, "endRowIndex": 36, "startColumnIndex": 8, "endColumnIndex": 9}
+            ]}}}],
+            "series": [{"series": {"sourceRange": {"sources": [
+                {"sheetId": 2, "startRowIndex": 5, "endRowIndex": 36, "startColumnIndex": 9, "endColumnIndex": 10}
+            ]}}}],
+        }}
         sheets = [
             {"properties": {"title": "Podsumowanie", "sheetId": 1}, "charts": [
                 {"chartId": 10, "spec": summary_horizontal},
@@ -204,6 +498,7 @@ class SheetsTests(unittest.TestCase):
             {"properties": {"title": MONTH_SHEETS[1], "sheetId": 2}, "charts": [
                 {"chartId": 20, "spec": monthly_categories},
                 {"chartId": 21, "spec": monthly_unrelated},
+                {"chartId": 22, "spec": monthly_shifted_daily},
             ]},
         ]
         sheets.extend(
@@ -217,7 +512,7 @@ class SheetsTests(unittest.TestCase):
         metadata = {"sheets": sheets}
         service = Mock()
         spreadsheets = service.spreadsheets.return_value
-        spreadsheets.get.return_value.execute.side_effect = [metadata, metadata]
+        spreadsheets.get.return_value.execute.side_effect = [metadata, metadata, metadata]
 
         SheetsGateway(service=service, spreadsheet_id="sheet-id").migrate_template()
 
@@ -228,13 +523,22 @@ class SheetsTests(unittest.TestCase):
         self.assertEqual(sort_requests[0]["range"]["endColumnIndex"], 14)
         self.assertEqual(sort_requests[0]["sortSpecs"], [{"dimensionIndex": 2, "sortOrder": "ASCENDING"}])
         chart_requests = [request["updateChartSpec"] for request in requests if "updateChartSpec" in request]
-        self.assertEqual([request["chartId"] for request in chart_requests], [11, 20])
+        self.assertEqual([request["chartId"] for request in chart_requests], [11, 20, 22])
         summary_ranges = chart_requests[0]["spec"]["pieChart"]
-        self.assertEqual(summary_ranges["domain"]["sourceRange"]["sources"][0]["endRowIndex"], 15)
-        self.assertEqual(summary_ranges["series"]["sourceRange"]["sources"][0]["endRowIndex"], 15)
+        self.assertEqual(summary_ranges["domain"]["sourceRange"]["sources"][0]["endRowIndex"], 17)
+        self.assertEqual(summary_ranges["series"]["sourceRange"]["sources"][0]["endRowIndex"], 17)
         monthly = chart_requests[1]["spec"]["basicChart"]
-        self.assertEqual(monthly["domains"][0]["domain"]["sourceRange"]["sources"][0]["endRowIndex"], 15)
-        self.assertEqual(monthly["series"][0]["series"]["sourceRange"]["sources"][0]["endRowIndex"], 15)
+        self.assertEqual(monthly["domains"][0]["domain"]["sourceRange"]["sources"][0]["endRowIndex"], 17)
+        self.assertEqual(monthly["series"][0]["series"]["sourceRange"]["sources"][0]["endRowIndex"], 17)
+        daily = chart_requests[2]["spec"]["basicChart"]
+        daily_sources = [
+            daily["domains"][0]["domain"]["sourceRange"]["sources"][0],
+            daily["series"][0]["series"]["sourceRange"]["sources"][0],
+        ]
+        self.assertEqual(
+            [(source["startRowIndex"], source["endRowIndex"]) for source in daily_sources],
+            [(3, 34), (3, 34)],
+        )
 
 
 class BackupTests(unittest.TestCase):

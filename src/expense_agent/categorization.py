@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from math import isfinite
+from typing import Any, Mapping, Protocol, cast
 import unicodedata
 
 from .constants import CATEGORIES, MCC_CATEGORY_RULES
@@ -15,8 +16,18 @@ class CategoryDecision:
     source: str = "model"
 
 
+class CategoryModel(Protocol):
+    def classify(self, **sanitized: Any) -> CategoryDecision: ...
+
+
 class Categorizer:
-    def __init__(self, *, store: Any, model: Any, mcc_rules: Mapping[int, str] | None = None):
+    def __init__(
+        self,
+        *,
+        store: Any,
+        model: CategoryModel,
+        mcc_rules: Mapping[int, str] | None = None,
+    ):
         self.store = store
         self.model = model
         self.mcc_rules = dict(MCC_CATEGORY_RULES if mcc_rules is None else mcc_rules)
@@ -30,46 +41,65 @@ class Categorizer:
         return "large"
 
     @staticmethod
-    def _merchant_key(merchant: str) -> str:
+    def _merchant_tokens(merchant: str) -> tuple[str, ...]:
         normalized = unicodedata.normalize("NFKD", merchant.casefold())
-        return "".join(character for character in normalized if character.isalnum())
+        tokens: list[str] = []
+        token: list[str] = []
+        for character in normalized:
+            if unicodedata.combining(character):
+                continue
+            if character.isalnum():
+                token.append(character)
+            elif token:
+                tokens.append("".join(token))
+                token = []
+        if token:
+            tokens.append("".join(token))
+        return tuple(tokens)
+
+    @staticmethod
+    def _matches_merchant_pattern(tokens: tuple[str, ...], pattern: tuple[str, ...]) -> bool:
+        length = len(pattern)
+        return any(tokens[index : index + length] == pattern for index in range(len(tokens) - length + 1))
+
+    @classmethod
+    def _matches_any_merchant_pattern(
+        cls, tokens: tuple[str, ...], patterns: tuple[tuple[str, ...], ...]
+    ) -> bool:
+        return any(cls._matches_merchant_pattern(tokens, pattern) for pattern in patterns)
 
     @staticmethod
     def _builtin_category(merchant: str) -> str | None:
-        merchant_key = Categorizer._merchant_key(merchant)
+        tokens = Categorizer._merchant_tokens(merchant)
 
         # Evaluate subscriptions before game platforms: Game Pass is not a game-store purchase.
-        if any(
-            pattern in merchant_key
-            for pattern in (
-                "gamepass",
-                "playstationplus",
-                "psplus",
-                "nintendoswitchonline",
-                "openai",
-                "chatgpt",
-                "google",
-            )
+        if Categorizer._matches_any_merchant_pattern(
+            tokens,
+            (
+                ("gamepass",), ("game", "pass"),
+                ("playstationplus",), ("playstation", "plus"), ("psplus",), ("ps", "plus"),
+                ("nintendoswitchonline",), ("nintendo", "switch", "online"),
+                ("openai",), ("chatgpt",), ("google",),
+            ),
         ):
             return "Подписки"
-        if any(
-            pattern in merchant_key
-            for pattern in (
-                "steam",
-                "epicgames",
-                "gog",
-                "battlenet",
-                "blizzard",
-                "ubisoft",
-                "riotgame",
-            )
-        ) or merchant_key in {"ea", "eacom", "eagames", "easports", "electronicarts"}:
+        if Categorizer._matches_any_merchant_pattern(
+            tokens,
+            (
+                ("steam",), ("epicgames",), ("epic", "games"), ("gog",), ("g", "o", "g"),
+                ("battlenet",), ("battle", "net"), ("blizzard",), ("ubisoft",),
+                ("riotgame",), ("riotgames",), ("riot", "game"), ("riot", "games"),
+                ("ea",), ("eacom",), ("eagames",), ("easports",), ("ea", "com"),
+                ("ea", "games"), ("ea", "sports"), ("electronicarts",),
+                ("electronic", "arts"),
+            ),
+        ):
             return "Игры"
-        if "zabka" in merchant_key:
+        if Categorizer._matches_any_merchant_pattern(tokens, (("zabka",),)):
             return "Еда и продукты"
-        if any(pattern in merchant_key for pattern in ("rossmann", "hebe")):
+        if Categorizer._matches_any_merchant_pattern(tokens, (("rossmann",), ("hebe",))):
             return "Здоровье / аптека"
-        if any(pattern in merchant_key for pattern in ("kwiaciarnia", "flower")):
+        if Categorizer._matches_any_merchant_pattern(tokens, (("kwiaciarnia",), ("flower",))):
             return "Развлечения"
         return None
 
@@ -93,6 +123,8 @@ class Categorizer:
             )
             if decision.category not in CATEGORIES:
                 raise ValueError("model returned an unknown category")
+            if not isfinite(decision.confidence) or not 0 <= decision.confidence <= 1:
+                raise ValueError("model returned an invalid confidence")
             if decision.confidence < 0.65:
                 raise ValueError("model returned insufficient confidence")
             return decision
@@ -106,7 +138,11 @@ class LangChainCategoryModel:
             from langchain_openai import ChatOpenAI
         except ImportError as exc:
             raise RuntimeError("Install project dependencies with: pip install -e .") from exc
-        self.structured = ChatOpenAI(api_key=api_key, model=model, temperature=0).with_structured_output(CategoryDecision)
+        from pydantic import SecretStr
+
+        self.structured = ChatOpenAI(
+            api_key=SecretStr(api_key), model=model, temperature=0
+        ).with_structured_output(CategoryDecision)
 
     def classify(self, **sanitized: Any) -> CategoryDecision:
         prompt = (
@@ -114,14 +150,18 @@ class LangChainCategoryModel:
             "Бытовые штуки means consumable household supplies; Для дома means durable home items or improvements. "
             f"Data: {sanitized}"
         )
-        result = self.structured.invoke(prompt)
+        result: object = self.structured.invoke(prompt)
         if isinstance(result, CategoryDecision):
             return result
         if isinstance(result, Mapping):
+            mapping = cast(Mapping[str, object], result)
+            confidence = mapping["confidence"]
+            if not isinstance(confidence, str | int | float):
+                raise TypeError("structured category confidence must be numeric")
             return CategoryDecision(
-                category=str(result["category"]),
-                confidence=float(result["confidence"]),
-                reason=str(result["reason"]),
-                source=str(result.get("source", "model")),
+                category=str(mapping["category"]),
+                confidence=float(confidence),
+                reason=str(mapping["reason"]),
+                source=str(mapping.get("source", "model")),
             )
         raise TypeError("structured category result must be a CategoryDecision or mapping")

@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from calendar import monthrange
 from datetime import date
 from pathlib import Path
-from typing import AbstractSet, Any, Iterable
+from typing import AbstractSet, Any, Iterable, cast
 
 from .constants import CATEGORIES, MONTH_SHEETS, REVIEW_STATUSES
 from .models import ChangeProposal
@@ -38,6 +39,103 @@ AGENT_LOG_HEADERS = (
     "Target Row",
     "Result",
 )
+
+CATEGORY_START_ROW = 4
+CATEGORY_LAST_ROW = CATEGORY_START_ROW + len(CATEGORIES) - 1
+CATEGORY_TOTAL_ROW = CATEGORY_LAST_ROW + 1
+CATEGORY_END_ROW_INDEX = CATEGORY_LAST_ROW
+
+
+def _cell_text(cell: dict[str, Any]) -> str:
+    value = cell.get("userEnteredValue", {})
+    return str(
+        cell.get("formattedValue")
+        or value.get("stringValue")
+        or value.get("formulaValue")
+        or ""
+    )
+
+
+def _find_total_label_row(sheet: dict[str, Any], *, column: int, label: str) -> int | None:
+    for grid in sheet.get("data", []):
+        start_row = int(grid.get("startRow", 0))
+        start_column = int(grid.get("startColumn", 0))
+        column_offset = column - start_column
+        if column_offset < 0:
+            continue
+        for row_offset, row_data in enumerate(grid.get("rowData", [])):
+            values = row_data.get("values", [])
+            if column_offset < len(values) and label in _cell_text(values[column_offset]):
+                return start_row + row_offset + 1
+    return None
+
+
+def _format_copy_request(
+    *,
+    sheet_id: int,
+    source_row: int,
+    destination_row: int,
+    start_column: int,
+    end_column: int,
+) -> dict[str, Any]:
+    return {
+        "copyPaste": {
+            "source": {
+                "sheetId": sheet_id,
+                "startRowIndex": source_row - 1,
+                "endRowIndex": source_row,
+                "startColumnIndex": start_column,
+                "endColumnIndex": end_column,
+            },
+            "destination": {
+                "sheetId": sheet_id,
+                "startRowIndex": destination_row - 1,
+                "endRowIndex": destination_row,
+                "startColumnIndex": start_column,
+                "endColumnIndex": end_column,
+            },
+            "pasteType": "PASTE_FORMAT",
+        }
+    }
+
+
+def format_copy_requests(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    requests: list[dict[str, Any]] = []
+    for sheet in metadata.get("sheets", []):
+        title = sheet["properties"]["title"]
+        if title in MONTH_SHEETS.values():
+            label, column, start_column, end_column = "RAZEM", 5, 5, 7
+        elif title == "Podsumowanie":
+            label, column, start_column, end_column = "ŁĄCZNIE", 0, 0, 14
+        else:
+            continue
+        old_total_row = _find_total_label_row(sheet, column=column, label=label)
+        if old_total_row is None or old_total_row >= CATEGORY_TOTAL_ROW:
+            continue
+        last_existing_category_row = old_total_row - 1
+        if last_existing_category_row < CATEGORY_START_ROW:
+            continue
+        sheet_id = int(sheet["properties"]["sheetId"])
+        requests.append(
+            _format_copy_request(
+                sheet_id=sheet_id,
+                source_row=old_total_row,
+                destination_row=CATEGORY_TOTAL_ROW,
+                start_column=start_column,
+                end_column=end_column,
+            )
+        )
+        for row in range(old_total_row, CATEGORY_TOTAL_ROW):
+            requests.append(
+                _format_copy_request(
+                    sheet_id=sheet_id,
+                    source_row=last_existing_category_row,
+                    destination_row=row,
+                    start_column=start_column,
+                    end_column=end_column,
+                )
+            )
+    return requests
 
 
 def validate_template_metadata(titles: Iterable[str]) -> None:
@@ -84,15 +182,26 @@ def extend_chart_ranges(
             end_column = value.get("endColumnIndex")
             start_row = value.get("startRowIndex")
             end_row = value.get("endRowIndex")
+            expected_span = category_end_row - (CATEGORY_START_ROW - 1)
+            legacy_range = (
+                start_row == CATEGORY_START_ROW - 1
+                and isinstance(end_row, int)
+                and CATEGORY_START_ROW - 1 < end_row < category_end_row
+            )
+            shifted_full_range = (
+                isinstance(start_row, int)
+                and isinstance(end_row, int)
+                and start_row > CATEGORY_START_ROW - 1
+                and end_row - start_row == expected_span
+            )
             if (
                 value.get("sheetId") == sheet_id
                 and isinstance(start_column, int)
                 and start_column in allowed_columns
                 and end_column == start_column + 1
-                and start_row == 3
-                and isinstance(end_row, int)
-                and 3 < end_row < category_end_row
+                and (legacy_range or shifted_full_range)
             ):
+                value["startRowIndex"] = CATEGORY_START_ROW - 1
                 value["endRowIndex"] = category_end_row
             for nested in value.values():
                 visit(nested)
@@ -111,10 +220,30 @@ class SheetsGateway:
         self.store = store
 
     def metadata(self) -> dict[str, Any]:
-        return self.service.spreadsheets().get(
+        return cast(
+            dict[str, Any],
+            self.service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id,
+                includeGridData=False,
+            ).execute(),
+        )
+
+    def _category_layout_metadata(self) -> dict[str, Any]:
+        ranges = [
+            *[
+                f"'{title}'!F{CATEGORY_START_ROW}:G{CATEGORY_TOTAL_ROW}"
+                for title in MONTH_SHEETS.values()
+            ],
+            f"Podsumowanie!A{CATEGORY_START_ROW}:N{CATEGORY_TOTAL_ROW}",
+        ]
+        result: object = self.service.spreadsheets().get(
             spreadsheetId=self.spreadsheet_id,
-            includeGridData=False,
+            ranges=ranges,
+            fields="sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values(formattedValue,userEnteredValue))))",
         ).execute()
+        if not isinstance(result, dict):
+            raise TypeError("category layout metadata must be a mapping")
+        return cast(dict[str, Any], result)
 
     def validate_template(self) -> dict[str, Any]:
         metadata = self.metadata()
@@ -158,7 +287,8 @@ class SheetsGateway:
         ).execute()
 
     def migrate_template(self) -> None:
-        metadata = self.validate_template()
+        metadata = self.metadata()
+        validate_template_metadata(sheet["properties"]["title"] for sheet in metadata.get("sheets", []))
         title_to_sheet = {sheet["properties"]["title"]: sheet for sheet in metadata["sheets"]}
         requests: list[dict[str, Any]] = []
         if "Review" not in title_to_sheet:
@@ -170,28 +300,38 @@ class SheetsGateway:
                 spreadsheetId=self.spreadsheet_id, body={"requests": requests}
             ).execute()
 
-        updates = [
+        formatting_requests = format_copy_requests(self._category_layout_metadata())
+        if formatting_requests:
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id, body={"requests": formatting_requests}
+            ).execute()
+
+        updates: list[dict[str, Any]] = [
             {"range": "Review!A1:N1", "values": [list(REVIEW_HEADERS)]},
             {"range": "'Agent Log'!A1:G1", "values": [list(AGENT_LOG_HEADERS)]},
         ]
         for title in MONTH_SHEETS.values():
             category_rows = [[category] for category in CATEGORIES]
-            formulas = [[f'=IFERROR(SUMIF(B$4:B,F{row},D$4:D),0)'] for row in range(4, 16)]
+            formulas = [[f'=IFERROR(SUMIF(B$4:B;F{row};D$4:D);0)'] for row in range(CATEGORY_START_ROW, CATEGORY_LAST_ROW + 1)]
             updates.extend(
                 [
-                    {"range": f"'{title}'!F4:F15", "values": category_rows},
-                    {"range": f"'{title}'!G4:G15", "values": formulas},
-                    {"range": f"'{title}'!F16:G16", "values": [["💰  RAZEM", "=SUM(G4:G15)"]]},
+                    {"range": f"'{title}'!F{CATEGORY_START_ROW}:F{CATEGORY_LAST_ROW}", "values": category_rows},
+                    {"range": f"'{title}'!G{CATEGORY_START_ROW}:G{CATEGORY_LAST_ROW}", "values": formulas},
+                    {"range": f"'{title}'!F{CATEGORY_TOTAL_ROW}:G{CATEGORY_TOTAL_ROW}", "values": [["💰  RAZEM", f"=SUM(G{CATEGORY_START_ROW}:G{CATEGORY_LAST_ROW})"]]},
                     {"range": f"'{title}'!D2", "values": [["=SUM(D4:D)"]]},
                 ]
             )
         summary_categories = [[category] for category in CATEGORIES]
-        updates.append({"range": "Podsumowanie!A4:A15", "values": summary_categories})
-        for row in range(4, 16):
-            formulas = [f"=IFERROR('{MONTH_SHEETS[month]}'!G{row},0)" for month in range(1, 13)]
-            formulas.append(f"=SUM(B{row}:M{row})")
-            updates.append({"range": f"Podsumowanie!B{row}:N{row}", "values": [formulas]})
-        updates.append({"range": "Podsumowanie!A16:N16", "values": [["💰  ŁĄCZNIE W MIESIĄCU", *[f"=SUM({column}4:{column}15)" for column in "BCDEFGHIJKLM"], "=SUM(N4:N15)"]]})
+        updates.append({"range": f"Podsumowanie!A{CATEGORY_START_ROW}:A{CATEGORY_LAST_ROW}", "values": summary_categories})
+        for row in range(CATEGORY_START_ROW, CATEGORY_LAST_ROW + 1):
+            summary_formulas = [
+                f"=IFERROR('{MONTH_SHEETS[month]}'!G{row};0)" for month in range(1, 13)
+            ]
+            summary_formulas.append(f"=SUM(B{row}:M{row})")
+            updates.append(
+                {"range": f"Podsumowanie!B{row}:N{row}", "values": [summary_formulas]}
+            )
+        updates.append({"range": f"Podsumowanie!A{CATEGORY_TOTAL_ROW}:N{CATEGORY_TOTAL_ROW}", "values": [["💰  ŁĄCZNIE W MIESIĄCU", *[f"=SUM({column}{CATEGORY_START_ROW}:{column}{CATEGORY_LAST_ROW})" for column in "BCDEFGHIJKLM"], f"=SUM(N{CATEGORY_START_ROW}:N{CATEGORY_LAST_ROW})"]]})
         self._values().batchUpdate(
             spreadsheetId=self.spreadsheet_id,
             body={"valueInputOption": "USER_ENTERED", "data": updates},
@@ -199,12 +339,17 @@ class SheetsGateway:
 
         refreshed = self.metadata()
         requests = []
+        title_to_month = {title: month for month, title in MONTH_SHEETS.items()}
         for sheet in refreshed.get("sheets", []):
             title = sheet["properties"]["title"]
             sheet_id = sheet["properties"]["sheetId"]
             chart_columns: AbstractSet[int] = frozenset()
+            daily_chart_end_row: int | None = None
             if title in MONTH_SHEETS.values():
                 chart_columns = frozenset({5, 6})
+                daily_chart_end_row = CATEGORY_START_ROW - 1 + monthrange(
+                    2026, title_to_month[title]
+                )[1]
                 requests.append(
                     {
                         "setDataValidation": {
@@ -230,9 +375,16 @@ class SheetsGateway:
                 spec = extend_chart_ranges(
                     chart["spec"],
                     sheet_id=sheet_id,
-                    category_end_row=15,
+                    category_end_row=CATEGORY_END_ROW_INDEX,
                     allowed_columns=chart_columns,
                 )
+                if daily_chart_end_row is not None:
+                    spec = extend_chart_ranges(
+                        spec,
+                        sheet_id=sheet_id,
+                        category_end_row=daily_chart_end_row,
+                        allowed_columns=frozenset({8, 9}),
+                    )
                 if spec != chart["spec"]:
                     requests.append({"updateChartSpec": {"chartId": chart["chartId"], "spec": spec}})
         if requests:
@@ -261,7 +413,7 @@ class SheetsGateway:
         result = self._values().get(
             spreadsheetId=self.spreadsheet_id, range="Review!A2:N"
         ).execute()
-        return result.get("values", [])
+        return cast(list[list[Any]], result.get("values", []))
 
     def apply_approved(self) -> dict[str, int]:
         synced = conflicts = errors = 0
@@ -283,7 +435,7 @@ class SheetsGateway:
                         spreadsheetId=self.spreadsheet_id,
                         range=f"'{target_sheet}'!A4:D",
                         valueInputOption="USER_ENTERED",
-                        insertDataOption="INSERT_ROWS",
+                        insertDataOption="OVERWRITE",
                         body={"values": values},
                     ).execute()
                 elif action == "EDIT":
@@ -366,8 +518,8 @@ def build_google_services(credentials_path: Path, token_path: Path) -> tuple[Any
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from googleapiclient.discovery import build
+        from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore[import-untyped]
+        from googleapiclient.discovery import build  # type: ignore[import-untyped]
     except ImportError as exc:
         raise RuntimeError("Install project dependencies with: pip install -e .") from exc
     scopes = [
@@ -376,7 +528,9 @@ def build_google_services(credentials_path: Path, token_path: Path) -> tuple[Any
     ]
     credentials = None
     if token_path.exists():
-        credentials = Credentials.from_authorized_user_file(str(token_path), scopes)
+        credentials = Credentials.from_authorized_user_file(  # type: ignore[no-untyped-call]
+            str(token_path), scopes
+        )
     if credentials is None or not credentials.valid:
         if credentials and credentials.expired and credentials.refresh_token:
             credentials.refresh(Request())
