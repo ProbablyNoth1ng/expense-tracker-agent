@@ -1,8 +1,8 @@
 import tempfile
 import unittest
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 from expense_agent.backups import BackupService
 from expense_agent.models import ChangeProposal
@@ -43,6 +43,20 @@ class MonobankTests(unittest.TestCase):
         list(client.iter_statements(["a"], datetime(2026, 7, 1, tzinfo=UTC), datetime(2026, 9, 1, tzinfo=UTC)))
         self.assertTrue(all(c.kwargs["headers"] == {"X-Token": "secret"} for c in transport.get.call_args_list))
         self.assertGreaterEqual(sleeper.call_count, 2)
+
+    def test_client_uses_unix_seconds_for_statement_window(self):
+        transport = Mock()
+        transport.get.return_value = Mock(status_code=200, json=lambda: [])
+        client = MonobankClient(token="secret", transport=transport, sleeper=Mock())
+        end = datetime(2026, 7, 19, 12, 34, 56, tzinfo=UTC)
+        start = end - timedelta(days=31)
+
+        list(client.iter_statements(["account-id"], start, end))
+
+        self.assertEqual(
+            transport.get.call_args.args[0],
+            "https://api.monobank.ua/personal/statement/account-id/1781786096/1784464496",
+        )
 
 
 class SheetsTests(unittest.TestCase):
@@ -321,6 +335,41 @@ class SheetsTests(unittest.TestCase):
 
         spreadsheets.values.return_value.append.assert_not_called()
         spreadsheets.batchUpdate.assert_called_once()
+
+    def test_monthly_expense_counts_uses_only_relevant_months_and_preserves_duplicates(self):
+        service = Mock()
+        values = service.spreadsheets.return_value.values.return_value
+        values.get.return_value.execute.side_effect = [
+            {"values": [["2026-06-30", "Food", "  LIDL ", 10.0]]},
+            {"values": [["2026-07-01", "Food", "Lidl", "10.00"]]},
+        ]
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+
+        counts = gateway.monthly_expense_counts(start=date(2026, 6, 30), end=date(2026, 7, 1))
+
+        key = gateway.expense_key(date(2026, 6, 30), "Lidl", 10.0)
+        self.assertEqual(counts[key], 1)
+        self.assertEqual(len(values.get.call_args_list), 2)
+
+    def test_apply_mirrors_review_and_final_statuses_to_database(self):
+        service = Mock()
+        store = Mock()
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id", store=store)
+        gateway.read_review_rows = Mock(return_value=[
+            ["Rejected", "ADD", "2026-07-16", "Food", "Old", 1.0, "monobank", "", "", "", "p-rejected"],
+            ["Approved", "ADD", "2026-07-17", "Food", "Lidl", 12.34, "monobank", "", "", "", "p-approved", "t1", "fp", "{}"],
+        ])
+
+        gateway.apply_approved()
+
+        self.assertEqual(
+            store.update_proposal_status_if_exists.call_args_list,
+            [
+                call("p-rejected", "Rejected"),
+                call("p-approved", "Approved"),
+                call("p-approved", "Synced"),
+            ],
+        )
 
     def test_sort_failure_does_not_report_staged_proposal_as_failed(self):
         service = Mock()

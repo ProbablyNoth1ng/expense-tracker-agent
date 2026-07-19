@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from collections import Counter
 from calendar import monthrange
 from datetime import date
 from pathlib import Path
@@ -415,11 +416,59 @@ class SheetsGateway:
         ).execute()
         return cast(list[list[Any]], result.get("values", []))
 
+    @staticmethod
+    def expense_key(transaction_date: date, merchant: object, amount: object) -> tuple[str, str, int]:
+        normalized_merchant = " ".join(str(merchant).casefold().split())
+        amount_cents = int(round(float(str(amount).replace(",", ".")) * 100))
+        return transaction_date.isoformat(), normalized_merchant, amount_cents
+
+    def monthly_expense_counts(
+        self, *, start: date, end: date
+    ) -> Counter[tuple[str, str, int]]:
+        if start > end:
+            return Counter()
+        months: list[tuple[int, int]] = []
+        year, month = start.year, start.month
+        while (year, month) <= (end.year, end.month):
+            months.append((year, month))
+            if month == 12:
+                year, month = year + 1, 1
+            else:
+                month += 1
+        counts: Counter[tuple[str, str, int]] = Counter()
+        for year, month in months:
+            if year != 2026:
+                continue
+            title = MONTH_SHEETS[month]
+            values = self._values().get(
+                spreadsheetId=self.spreadsheet_id, range=f"'{title}'!A4:D"
+            ).execute().get("values", [])
+            for row in values:
+                if len(row) < 4:
+                    continue
+                try:
+                    transaction_date = date.fromisoformat(str(row[0]))
+                    key = self.expense_key(transaction_date, row[2], row[3])
+                except (TypeError, ValueError):
+                    continue
+                if start <= transaction_date <= end:
+                    counts[key] += 1
+        return counts
+
+    def _mirror_proposal_status(self, row: list[Any], status: str) -> None:
+        if self.store is None or len(row) <= 10 or not str(row[10]).strip():
+            return
+        update = getattr(self.store, "update_proposal_status_if_exists", None)
+        if callable(update):
+            update(str(row[10]), status)
+
     def apply_approved(self) -> dict[str, int]:
         synced = conflicts = errors = 0
         for index, row in enumerate(self.read_review_rows(), start=2):
             padded = list(row) + [""] * (len(REVIEW_HEADERS) - len(row))
-            if padded[0] != "Approved":
+            current_status = str(padded[0])
+            self._mirror_proposal_status(padded, current_status)
+            if current_status != "Approved":
                 continue
             target_sheet = ""
             target_row: int | str = ""
@@ -449,6 +498,7 @@ class SheetsGateway:
                     expected = target.get("expected")
                     if expected is not None and (not current or current[0] != expected):
                         self._set_review_status(index, "Conflict")
+                        self._mirror_proposal_status(padded, "Conflict")
                         self._append_agent_log(padded, target_sheet, target_row, "Conflict")
                         conflicts += 1
                         continue
@@ -461,11 +511,13 @@ class SheetsGateway:
                 else:
                     raise ValueError("Only ADD and EDIT are supported")
                 self._set_review_status(index, "Synced")
+                self._mirror_proposal_status(padded, "Synced")
                 self._learn_from_review_row(padded)
                 self._append_agent_log(padded, target_sheet, target_row, "Synced")
                 synced += 1
             except Exception:
                 self._set_review_status(index, "Error")
+                self._mirror_proposal_status(padded, "Error")
                 self._append_agent_log(padded, target_sheet, target_row, "Error")
                 errors += 1
         return {"synced": synced, "conflicts": conflicts, "errors": errors}

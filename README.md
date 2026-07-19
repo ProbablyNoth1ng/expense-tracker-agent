@@ -7,7 +7,7 @@ The agent never writes imported data directly into monthly sheets. It creates pr
 ## What is implemented
 
 - Monobank personal API import from selected accounts.
-- Settled outgoing transactions only; incoming payments and holds are ignored.
+- Settled and held outgoing transactions are staged for review; incoming payments are ignored.
 - PLN conversion through the official NBP API when the original transaction is not PLN.
 - Deterministic merchant and MCC rules before `gpt-5.4-mini` fallback.
 - Automatic learning from approved merchant/category corrections.
@@ -48,7 +48,7 @@ pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-The first sync starts at July 1, 2026. It does not re-import the existing April–June rows.
+Every sync fetches the preceding 31 days through the current Unix second for every selected account. It adds outgoing bank transactions, including holds, absent from SQLite to `Review` as `Pending`; exact date/shop/amount matches already present in monthly sheets are recorded locally without creating duplicate Review rows.
 
 ## Commands
 
@@ -87,4 +87,3 @@ python -m build
 - Only merchant text, MCC, amount band, and allowed categories are sent to OpenAI.
 - Account IDs, balances, IBANs, tokens, and raw statement payloads are not sent to OpenAI.
 - The language model cannot call spreadsheet write methods directly.
-

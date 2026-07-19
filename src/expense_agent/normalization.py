@@ -32,7 +32,7 @@ def normalize_transaction(
     timezone: str = "Europe/Warsaw",
     allowed_year: int = 2026,
 ) -> NormalizedTransaction | None:
-    if raw.hold or raw.amount >= 0:
+    if raw.amount >= 0:
         return None
     timestamp = datetime.fromtimestamp(raw.time, tz=UTC).astimezone(ZoneInfo(timezone))
     if timestamp.year != allowed_year:
@@ -57,4 +57,3 @@ def normalize_transaction(
         original_currency=currency,
         fingerprint=fingerprint,
     )
-

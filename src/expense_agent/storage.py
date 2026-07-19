@@ -22,6 +22,12 @@ class StateStore:
                 account_id TEXT PRIMARY KEY,
                 cursor_iso TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS sync_reconciliations (
+                account_id TEXT PRIMARY KEY,
+                completed_at TEXT NOT NULL,
+                start_iso TEXT NOT NULL,
+                end_iso TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS transactions (
                 source_transaction_id TEXT PRIMARY KEY,
                 fingerprint TEXT NOT NULL UNIQUE,
@@ -89,6 +95,28 @@ class StateStore:
                 (account_id, cursor.isoformat()),
             )
 
+    def reconciliation_completed(self, account_id: str) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM sync_reconciliations WHERE account_id = ?", (account_id,)
+        ).fetchone()
+        return row is not None
+
+    def mark_reconciliation_complete(
+        self,
+        account_id: str,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO sync_reconciliations(account_id, completed_at, start_iso, end_iso) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(account_id) DO UPDATE SET "
+                "completed_at = excluded.completed_at, start_iso = excluded.start_iso, end_iso = excluded.end_iso",
+                (account_id, end.isoformat(), start.isoformat(), end.isoformat()),
+            )
+
     @staticmethod
     def _merchant_key(merchant: str) -> str:
         return " ".join(merchant.casefold().split())
@@ -125,12 +153,25 @@ class StateStore:
         action: str,
         source_transaction_id: str | None,
         payload: dict[str, Any],
+        status: str = "Pending",
     ) -> None:
         with self.connection:
             self.connection.execute(
-                "INSERT INTO proposals(id, action, source_transaction_id, payload_json, status) VALUES (?, ?, ?, ?, 'Pending')",
-                (proposal_id, action, source_transaction_id, json.dumps(payload, ensure_ascii=False, default=str)),
+                "INSERT INTO proposals(id, action, source_transaction_id, payload_json, status) VALUES (?, ?, ?, ?, ?)",
+                (proposal_id, action, source_transaction_id, json.dumps(payload, ensure_ascii=False, default=str), status),
             )
+
+    def update_proposal_status_if_exists(self, proposal_id: str, status: str) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE proposals SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, proposal_id),
+            )
+        return cursor.rowcount == 1
+
+    def delete_proposal(self, proposal_id: str) -> None:
+        with self.connection:
+            self.connection.execute("DELETE FROM proposals WHERE id = ?", (proposal_id,))
 
     def set_proposal_status(self, proposal_id: str, status: str) -> None:
         with self.connection:

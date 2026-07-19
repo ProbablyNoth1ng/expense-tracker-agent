@@ -49,7 +49,7 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(result.original_currency, "PLN")
         self.assertEqual(result.merchant, "Lidl")
 
-    def test_pending_and_incoming_transactions_are_ignored(self):
+    def test_held_outgoing_is_normalized_but_incoming_is_ignored(self):
         base = dict(
             id="x",
             account_id="a",
@@ -59,7 +59,7 @@ class NormalizationTests(unittest.TestCase):
             operation_amount=-100,
             currency_code=985,
         )
-        self.assertIsNone(normalize_transaction(RawTransaction(**base, amount=-100, hold=True)))
+        self.assertIsNotNone(normalize_transaction(RawTransaction(**base, amount=-100, hold=True)))
         self.assertIsNone(normalize_transaction(RawTransaction(**base, amount=100, hold=False)))
 
     def test_other_year_is_rejected(self):
@@ -92,6 +92,13 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.store.get_cursor("acc"), cursor)
         self.store.upsert_merchant_rule("lidl", 5411, "Еда и продукты")
         self.assertEqual(self.store.find_merchant_rule("lidl", 5411), "Еда и продукты")
+
+    def test_reconciliation_marker_persists_per_account(self):
+        start = datetime(2026, 6, 17, tzinfo=UTC)
+        end = datetime(2026, 7, 18, tzinfo=UTC)
+        self.assertFalse(self.store.reconciliation_completed("acc"))
+        self.store.mark_reconciliation_complete("acc", start=start, end=end)
+        self.assertTrue(self.store.reconciliation_completed("acc"))
 
     def test_proposal_lifecycle_is_auditable(self):
         proposal_id = self.store.create_proposal(
