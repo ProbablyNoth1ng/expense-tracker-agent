@@ -2,7 +2,9 @@ import tempfile
 import unittest
 from datetime import UTC, date, datetime
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
+
+from googleapiclient.errors import HttpError
 
 from expense_agent.backups import BackupService
 from expense_agent.models import ChangeProposal
@@ -46,6 +48,20 @@ class MonobankTests(unittest.TestCase):
 
 
 class SheetsTests(unittest.TestCase):
+    @staticmethod
+    def _approved_row(
+        *,
+        proposal_id: str,
+        action: str = "ADD",
+        transaction_date: str = "2026-07-17",
+        target: str = "{}",
+        amount: object = 12.34,
+    ) -> list[object]:
+        return [
+            "Approved", action, transaction_date, "Food", "Lidl", amount, "monobank", 0.95,
+            "MCC 5411", "", proposal_id, "t1", "fp", target,
+        ]
+
     @staticmethod
     def _migration_metadata(*, total_row: int = 16):
         sheets = []
@@ -321,6 +337,227 @@ class SheetsTests(unittest.TestCase):
 
         spreadsheets.values.return_value.append.assert_not_called()
         spreadsheets.batchUpdate.assert_called_once()
+
+    def test_monthly_expense_counts_uses_only_relevant_months_and_preserves_duplicates(self):
+        service = Mock()
+        values = service.spreadsheets.return_value.values.return_value
+        values.get.return_value.execute.side_effect = [
+            {"values": [["2026-06-30", "Food", "  LIDL ", 10.0]]},
+            {"values": [["2026-07-01", "Food", "Lidl", "10.00"]]},
+        ]
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+
+        counts = gateway.monthly_expense_counts(start=date(2026, 6, 30), end=date(2026, 7, 1))
+
+        key = gateway.expense_key(date(2026, 6, 30), "Lidl", 10.0)
+        self.assertEqual(counts[key], 1)
+        self.assertEqual(len(values.get.call_args_list), 2)
+
+    def test_apply_mirrors_review_and_final_statuses_to_database(self):
+        service = Mock()
+        store = Mock()
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id", store=store)
+        gateway.read_review_rows = Mock(return_value=[
+            ["Rejected", "ADD", "2026-07-16", "Food", "Old", 1.0, "monobank", "", "", "", "p-rejected"],
+            ["Approved", "ADD", "2026-07-17", "Food", "Lidl", 12.34, "monobank", "", "", "", "p-approved", "t1", "fp", "{}"],
+        ])
+
+        gateway.apply_approved()
+
+        self.assertEqual(
+            store.update_proposal_status_if_exists.call_args_list,
+            [
+                call("p-rejected", "Rejected"),
+                call("p-approved", "Approved"),
+                call("p-approved", "Synced"),
+            ],
+        )
+
+    def test_parse_amount_pln_accepts_polish_and_legacy_decimal_formats(self):
+        cases = (
+            ("22,5", 22.5),
+            ("1 234,56", 1234.56),
+            ("1\u00a0234,56", 1234.56),
+            ("22.5", 22.5),
+            (8, 8.0),
+        )
+
+        for raw_amount, expected in cases:
+            with self.subTest(raw_amount=raw_amount):
+                self.assertEqual(SheetsGateway.parse_amount_pln(raw_amount), expected)
+
+    def test_parse_amount_pln_rejects_invalid_or_ambiguous_values(self):
+        for raw_amount in ("", "12,34,56", "1,234.56", float("nan"), float("inf")):
+            with self.subTest(raw_amount=raw_amount):
+                with self.assertRaisesRegex(ValueError, "Amount PLN"):
+                    SheetsGateway.parse_amount_pln(raw_amount)
+
+    def test_apply_writes_localized_add_and_edit_amounts_as_numbers(self):
+        service = Mock()
+        values = service.spreadsheets.return_value.values.return_value
+        values.batchGet.return_value.execute.return_value = {
+            "valueRanges": [{"values": [["2026-07-01", "Food", "Lidl", 12.34]]}]
+        }
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway.read_review_rows = Mock(return_value=[
+            self._approved_row(proposal_id="p-add", amount="22,5"),
+            self._approved_row(
+                proposal_id="p-edit",
+                action="EDIT",
+                amount="1 234,56",
+                target='{"sheet": "Lipiec", "row": 8, "expected": ["2026-07-01", "Food", "Lidl", 12.34]}',
+            ),
+        ])
+
+        result = gateway.apply_approved()
+
+        self.assertEqual(result, {"synced": 2, "conflicts": 0, "errors": 0})
+        monthly_append = next(
+            call for call in values.append.call_args_list
+            if call.kwargs["range"] == "'Lipiec'!A4:D"
+        )
+        self.assertEqual(monthly_append.kwargs["body"]["values"][0][3], 22.5)
+        self.assertIsInstance(monthly_append.kwargs["body"]["values"][0][3], float)
+        edit_batch = next(
+            call for call in values.batchUpdate.call_args_list
+            if call.kwargs["body"]["valueInputOption"] == "USER_ENTERED"
+        )
+        self.assertEqual(edit_batch.kwargs["body"]["data"][0]["values"][0][3], 1234.56)
+        self.assertIsInstance(edit_batch.kwargs["body"]["data"][0]["values"][0][3], float)
+
+    def test_apply_marks_malformed_amount_as_error_and_logs_the_row_reason(self):
+        service = Mock()
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway.read_review_rows = Mock(return_value=[
+            self._approved_row(proposal_id="p-invalid", amount="12,34,56"),
+        ])
+
+        with self.assertLogs("expense_agent.sheets", level="WARNING") as captured:
+            result = gateway.apply_approved()
+
+        self.assertEqual(result, {"synced": 0, "conflicts": 0, "errors": 1})
+        monthly_writes = [
+            call for call in service.spreadsheets.return_value.values.return_value.append.call_args_list
+            if call.kwargs["range"] == "'Lipiec'!A4:D"
+        ]
+        self.assertEqual(monthly_writes, [])
+        self.assertTrue(any("Review row 2" in message for message in captured.output))
+        self.assertTrue(any("Amount PLN" in message for message in captured.output))
+
+    def test_apply_groups_large_mixed_backlog_into_at_most_fifteen_writes(self):
+        service = Mock()
+        values = service.spreadsheets.return_value.values.return_value
+        edit_expected = ["2026-07-01", "Food", "Lidl", 12.34]
+        values.batchGet.return_value.execute.return_value = {"valueRanges": [{"values": [edit_expected]}]}
+        rows = [
+            self._approved_row(proposal_id=f"p-{month}", transaction_date=f"2026-{month:02d}-01")
+            for month in range(1, 13)
+        ]
+        rows.append(
+            self._approved_row(
+                proposal_id="p-edit",
+                action="EDIT",
+                target='{"sheet": "Lipiec", "row": 8, "expected": ["2026-07-01", "Food", "Lidl", 12.34]}',
+            )
+        )
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway.read_review_rows = Mock(return_value=rows)
+
+        result = gateway.apply_approved()
+
+        self.assertEqual(result, {"synced": 13, "conflicts": 0, "errors": 0})
+        self.assertEqual(values.append.call_count, 13)
+        self.assertEqual(values.batchUpdate.call_count, 2)
+        self.assertEqual(values.append.call_count + values.batchUpdate.call_count, 15)
+        values.update.assert_not_called()
+        status_batch = next(
+            call for call in values.batchUpdate.call_args_list
+            if call.kwargs["body"]["valueInputOption"] == "RAW"
+        )
+        self.assertEqual(len(status_batch.kwargs["body"]["data"]), 13)
+
+    def test_apply_retries_a_quota_limited_monthly_append(self):
+        class Clock:
+            def __init__(self):
+                self.value = 0.0
+                self.sleeps: list[float] = []
+
+            def monotonic(self) -> float:
+                return self.value
+
+            def sleep(self, seconds: float) -> None:
+                self.sleeps.append(seconds)
+                self.value += seconds
+
+        response = Mock(status=429, reason="Too Many Requests")
+        quota_error = HttpError(response, b"quota exceeded")
+        clock = Clock()
+        service = Mock()
+        values = service.spreadsheets.return_value.values.return_value
+        values.append.return_value.execute.side_effect = [quota_error, None, None]
+        gateway = SheetsGateway(
+            service=service,
+            spreadsheet_id="sheet-id",
+            sleeper=clock.sleep,
+            monotonic=clock.monotonic,
+            random_float=lambda: 0.0,
+        )
+        gateway.read_review_rows = Mock(return_value=[self._approved_row(proposal_id="p1")])
+
+        result = gateway.apply_approved()
+
+        self.assertEqual(result, {"synced": 1, "conflicts": 0, "errors": 0})
+        self.assertEqual(clock.sleeps, [1.0])
+
+    def test_apply_marks_an_edit_conflict_when_batch_preflight_omits_its_target(self):
+        service = Mock()
+        values = service.spreadsheets.return_value.values.return_value
+        values.batchGet.return_value.execute.return_value = {"valueRanges": []}
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway.read_review_rows = Mock(return_value=[
+            self._approved_row(
+                proposal_id="p-edit",
+                action="EDIT",
+                target='{"sheet": "Lipiec", "row": 8, "expected": ["2026-07-01", "Food", "Lidl", 12.34]}',
+            )
+        ])
+
+        result = gateway.apply_approved()
+
+        self.assertEqual(result, {"synced": 0, "conflicts": 1, "errors": 0})
+        self.assertEqual(values.batchUpdate.call_count, 1)
+        self.assertEqual(values.batchUpdate.call_args.kwargs["body"]["valueInputOption"], "RAW")
+
+    def test_apply_stops_quota_retries_after_shared_three_minute_deadline(self):
+        class Clock:
+            def __init__(self):
+                self.value = 0.0
+
+            def monotonic(self) -> float:
+                return self.value
+
+            def sleep(self, seconds: float) -> None:
+                self.value += seconds
+
+        clock = Clock()
+        service = Mock()
+        values = service.spreadsheets.return_value.values.return_value
+        values.append.return_value.execute.side_effect = lambda: (_ for _ in ()).throw(
+            HttpError(Mock(status=429, reason="Too Many Requests"), b"quota exceeded")
+        )
+        gateway = SheetsGateway(
+            service=service,
+            spreadsheet_id="sheet-id",
+            sleeper=clock.sleep,
+            monotonic=clock.monotonic,
+            random_float=lambda: 0.0,
+        )
+        gateway.read_review_rows = Mock(return_value=[self._approved_row(proposal_id="p1")])
+
+        with self.assertRaisesRegex(RuntimeError, "Google Sheets write quota remained exhausted"):
+            gateway.apply_approved()
+
+        values.batchUpdate.assert_not_called()
 
     def test_sort_failure_does_not_report_staged_proposal_as_failed(self):
         service = Mock()

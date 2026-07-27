@@ -3,10 +3,17 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
+import random
+import re
+import time
+from collections import Counter
 from calendar import monthrange
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from typing import AbstractSet, Any, Iterable, cast
+from typing import AbstractSet, Any, Callable, Iterable, cast
+
+from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 
 from .constants import CATEGORIES, MONTH_SHEETS, REVIEW_STATUSES
 from .models import ChangeProposal
@@ -44,6 +51,12 @@ CATEGORY_START_ROW = 4
 CATEGORY_LAST_ROW = CATEGORY_START_ROW + len(CATEGORIES) - 1
 CATEGORY_TOTAL_ROW = CATEGORY_LAST_ROW + 1
 CATEGORY_END_ROW_INDEX = CATEGORY_LAST_ROW
+SHEETS_QUOTA_RETRY_DEADLINE_SECONDS = 180.0
+SHEETS_QUOTA_RETRY_MAX_DELAY_SECONDS = 32.0
+
+
+class SheetsQuotaExhaustedError(RuntimeError):
+    """Raised when Google Sheets remains rate-limited for the whole retry window."""
 
 
 def _cell_text(cell: dict[str, Any]) -> str:
@@ -214,10 +227,22 @@ def extend_chart_ranges(
 
 
 class SheetsGateway:
-    def __init__(self, *, service: Any, spreadsheet_id: str, store: Any | None = None):
+    def __init__(
+        self,
+        *,
+        service: Any,
+        spreadsheet_id: str,
+        store: Any | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+        random_float: Callable[[], float] = random.random,
+    ):
         self.service = service
         self.spreadsheet_id = spreadsheet_id
         self.store = store
+        self.sleeper = sleeper
+        self.monotonic = monotonic
+        self.random_float = random_float
 
     def metadata(self) -> dict[str, Any]:
         return cast(
@@ -415,59 +440,245 @@ class SheetsGateway:
         ).execute()
         return cast(list[list[Any]], result.get("values", []))
 
+    @staticmethod
+    def parse_amount_pln(value: object) -> float:
+        """Return a finite numeric amount from Polish or legacy decimal input."""
+        if isinstance(value, bool):
+            raise ValueError("Amount PLN must be a number")
+        if isinstance(value, (int, float)):
+            amount = float(value)
+        elif isinstance(value, str):
+            normalized = value.strip().replace(" ", "").replace("\u00a0", "").replace("\u202f", "")
+            if not normalized:
+                raise ValueError("Amount PLN is required")
+            if "." in normalized and "," in normalized:
+                raise ValueError("Amount PLN cannot mix comma and dot separators")
+            if not re.fullmatch(r"[+-]?(?:\d+(?:[,.]\d+)?|[,.]\d+)", normalized):
+                raise ValueError(f"Amount PLN is not a valid number: {value!r}")
+            amount = float(normalized.replace(",", "."))
+        else:
+            raise ValueError("Amount PLN must be a number")
+        if not math.isfinite(amount):
+            raise ValueError("Amount PLN must be finite")
+        return amount
+
+    @staticmethod
+    def expense_key(transaction_date: date, merchant: object, amount: object) -> tuple[str, str, int]:
+        normalized_merchant = " ".join(str(merchant).casefold().split())
+        amount_cents = int(round(SheetsGateway.parse_amount_pln(amount) * 100))
+        return transaction_date.isoformat(), normalized_merchant, amount_cents
+
+    def monthly_expense_counts(
+        self, *, start: date, end: date
+    ) -> Counter[tuple[str, str, int]]:
+        if start > end:
+            return Counter()
+        months: list[tuple[int, int]] = []
+        year, month = start.year, start.month
+        while (year, month) <= (end.year, end.month):
+            months.append((year, month))
+            if month == 12:
+                year, month = year + 1, 1
+            else:
+                month += 1
+        counts: Counter[tuple[str, str, int]] = Counter()
+        for year, month in months:
+            if year != 2026:
+                continue
+            title = MONTH_SHEETS[month]
+            values = self._values().get(
+                spreadsheetId=self.spreadsheet_id, range=f"'{title}'!A4:D"
+            ).execute().get("values", [])
+            for row in values:
+                if len(row) < 4:
+                    continue
+                try:
+                    transaction_date = date.fromisoformat(str(row[0]))
+                    key = self.expense_key(transaction_date, row[2], row[3])
+                except (TypeError, ValueError):
+                    continue
+                if start <= transaction_date <= end:
+                    counts[key] += 1
+        return counts
+
+    def _mirror_proposal_status(self, row: list[Any], status: str) -> None:
+        if self.store is None or len(row) <= 10 or not str(row[10]).strip():
+            return
+        update = getattr(self.store, "update_proposal_status_if_exists", None)
+        if callable(update):
+            update(str(row[10]), status)
+
+    @staticmethod
+    def _http_status(error: HttpError) -> int | None:
+        status = getattr(getattr(error, "resp", None), "status", None)
+        if isinstance(status, (int, str)):
+            try:
+                return int(status)
+            except ValueError:
+                return None
+        return None
+
+    def _execute_write(self, request: Callable[[], Any], *, deadline: float) -> Any:
+        attempt = 0
+        while True:
+            try:
+                return request().execute()
+            except HttpError as error:
+                if self._http_status(error) != 429:
+                    raise
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    raise SheetsQuotaExhaustedError(
+                        "Google Sheets write quota remained exhausted after retrying for three minutes; "
+                        "approved rows remain available for a later apply."
+                    ) from error
+                delay = min(
+                    remaining,
+                    min(SHEETS_QUOTA_RETRY_MAX_DELAY_SECONDS, 2.0**attempt) + self.random_float(),
+                )
+                self.sleeper(delay)
+                attempt += 1
+
     def apply_approved(self) -> dict[str, int]:
-        synced = conflicts = errors = 0
+        outcomes: list[dict[str, Any]] = []
+        adds: dict[str, list[list[Any]]] = {}
+        edits: list[dict[str, Any]] = []
         for index, row in enumerate(self.read_review_rows(), start=2):
             padded = list(row) + [""] * (len(REVIEW_HEADERS) - len(row))
-            if padded[0] != "Approved":
+            current_status = str(padded[0])
+            self._mirror_proposal_status(padded, current_status)
+            if current_status != "Approved":
                 continue
-            target_sheet = ""
-            target_row: int | str = ""
+            outcome: dict[str, Any] = {
+                "index": index,
+                "row": padded,
+                "status": None,
+                "target_sheet": "",
+                "target_row": "",
+            }
             try:
                 transaction_date = date.fromisoformat(str(padded[2]))
                 if transaction_date.year != 2026:
                     raise ValueError("Only 2026 is supported")
                 action = str(padded[1])
-                values = [[transaction_date.isoformat(), padded[3], padded[4], float(padded[5])]]
+                values = [[
+                    transaction_date.isoformat(), padded[3], padded[4], self.parse_amount_pln(padded[5])
+                ]]
                 if action == "ADD":
                     target_sheet = MONTH_SHEETS[transaction_date.month]
-                    self._values().append(
-                        spreadsheetId=self.spreadsheet_id,
-                        range=f"'{target_sheet}'!A4:D",
-                        valueInputOption="USER_ENTERED",
-                        insertDataOption="OVERWRITE",
-                        body={"values": values},
-                    ).execute()
+                    outcome["target_sheet"] = target_sheet
+                    adds.setdefault(target_sheet, []).extend(values)
                 elif action == "EDIT":
                     target = json.loads(padded[13] or "{}")
+                    if not isinstance(target, dict):
+                        raise ValueError("EDIT target must be an object")
                     target_sheet = str(target["sheet"])
                     target_row = int(target["row"])
-                    current = self._values().get(
-                        spreadsheetId=self.spreadsheet_id,
-                        range=f"'{target_sheet}'!A{target_row}:D{target_row}",
-                    ).execute().get("values", [[]])
-                    expected = target.get("expected")
-                    if expected is not None and (not current or current[0] != expected):
-                        self._set_review_status(index, "Conflict")
-                        self._append_agent_log(padded, target_sheet, target_row, "Conflict")
-                        conflicts += 1
-                        continue
-                    self._values().update(
-                        spreadsheetId=self.spreadsheet_id,
-                        range=f"'{target_sheet}'!A{target_row}:D{target_row}",
-                        valueInputOption="USER_ENTERED",
-                        body={"values": values},
-                    ).execute()
+                    if not target_sheet or target_row < 1:
+                        raise ValueError("EDIT target sheet and row are required")
+                    outcome.update(
+                        target_sheet=target_sheet,
+                        target_row=target_row,
+                        target=target,
+                        values=values,
+                    )
+                    edits.append(outcome)
                 else:
                     raise ValueError("Only ADD and EDIT are supported")
-                self._set_review_status(index, "Synced")
-                self._learn_from_review_row(padded)
-                self._append_agent_log(padded, target_sheet, target_row, "Synced")
+            except Exception as error:
+                outcome["status"] = "Error"
+                logger.warning(
+                    "Review row %s (proposal %s) marked Error: %s",
+                    index,
+                    padded[10] or "unknown",
+                    error,
+                )
+            outcomes.append(outcome)
+
+        if edits:
+            ranges = [
+                f"'{outcome['target_sheet']}'!A{outcome['target_row']}:D{outcome['target_row']}"
+                for outcome in edits
+            ]
+            result = self._values().batchGet(
+                spreadsheetId=self.spreadsheet_id, ranges=ranges
+            ).execute()
+            value_ranges = cast(list[dict[str, Any]], result.get("valueRanges", []))
+            for position, outcome in enumerate(edits):
+                value_range = value_ranges[position] if position < len(value_ranges) else {}
+                current = value_range.get("values", [[]])
+                expected = outcome["target"].get("expected")
+                if expected is not None and (not current or current[0] != expected):
+                    outcome["status"] = "Conflict"
+
+        deadline = self.monotonic() + SHEETS_QUOTA_RETRY_DEADLINE_SECONDS
+        for target_sheet, values in adds.items():
+            def append_rows(
+                target_sheet: str = target_sheet, values: list[list[Any]] = values
+            ) -> Any:
+                return self._values().append(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"'{target_sheet}'!A4:D",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="OVERWRITE",
+                    body={"values": values},
+                )
+
+            self._execute_write(
+                append_rows,
+                deadline=deadline,
+            )
+
+        valid_edits = [outcome for outcome in edits if outcome["status"] is None]
+        if valid_edits:
+            self._execute_write(
+                lambda: self._values().batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={
+                        "valueInputOption": "USER_ENTERED",
+                        "data": [
+                            {
+                                "range": f"'{outcome['target_sheet']}'!A{outcome['target_row']}:D{outcome['target_row']}",
+                                "values": outcome["values"],
+                            }
+                            for outcome in valid_edits
+                        ],
+                    },
+                ),
+                deadline=deadline,
+            )
+
+        for outcome in outcomes:
+            if outcome["status"] is None:
+                outcome["status"] = "Synced"
+        if outcomes:
+            self._execute_write(
+                lambda: self._values().batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={
+                        "valueInputOption": "RAW",
+                        "data": [
+                            {"range": f"Review!A{outcome['index']}", "values": [[outcome["status"]]]}
+                            for outcome in outcomes
+                        ],
+                    },
+                ),
+                deadline=deadline,
+            )
+
+        synced = conflicts = errors = 0
+        for outcome in outcomes:
+            status = cast(str, outcome["status"])
+            row = cast(list[Any], outcome["row"])
+            self._mirror_proposal_status(row, status)
+            if status == "Synced":
                 synced += 1
-            except Exception:
-                self._set_review_status(index, "Error")
-                self._append_agent_log(padded, target_sheet, target_row, "Error")
+                self._learn_from_review_row(row)
+            elif status == "Conflict":
+                conflicts += 1
+            else:
                 errors += 1
+        self._append_agent_logs(outcomes, deadline=deadline)
         return {"synced": synced, "conflicts": conflicts, "errors": errors}
 
     def _learn_from_review_row(self, row: list[Any]) -> None:
@@ -479,27 +690,36 @@ class SheetsGateway:
         if mcc is not None:
             self.store.upsert_merchant_rule(str(row[4]), int(mcc), str(row[3]))
 
-    def _append_agent_log(self, row: list[Any], target_sheet: str, target_row: object, result: str) -> None:
-        try:
-            from datetime import datetime
-
-            self._values().append(
-                spreadsheetId=self.spreadsheet_id,
-                range="'Agent Log'!A:G",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={"values": [[datetime.now().astimezone().isoformat(), row[10], row[1], row[11], target_sheet, target_row, result]]},
-            ).execute()
-        except Exception:
+    def _append_agent_logs(self, outcomes: list[dict[str, Any]], *, deadline: float) -> None:
+        if not outcomes:
             return
-
-    def _set_review_status(self, row: int, status: str) -> None:
-        self._values().update(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"Review!A{row}",
-            valueInputOption="RAW",
-            body={"values": [[status]]},
-        ).execute()
+        try:
+            timestamp = datetime.now().astimezone().isoformat()
+            self._execute_write(
+                lambda: self._values().append(
+                    spreadsheetId=self.spreadsheet_id,
+                    range="'Agent Log'!A:G",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={
+                        "values": [
+                            [
+                                timestamp,
+                                outcome["row"][10],
+                                outcome["row"][1],
+                                outcome["row"][11],
+                                outcome["target_sheet"],
+                                outcome["target_row"],
+                                outcome["status"],
+                            ]
+                            for outcome in outcomes
+                        ]
+                    },
+                ),
+                deadline=deadline,
+            )
+        except Exception:
+            logger.warning("Agent Log append failed after Review statuses were saved", exc_info=True)
 
     def find_expense_candidates(self, query: str) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []

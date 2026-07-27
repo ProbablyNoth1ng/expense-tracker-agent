@@ -48,7 +48,7 @@ pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-The first sync starts at July 1, 2026. It does not re-import the existing April–June rows.
+The first sync after this update reconciles the previous 31 days for every selected account. It adds bank transactions absent from SQLite to `Review` as `Pending`; exact date/shop/amount matches already present in monthly sheets are recorded locally without creating duplicate Review rows. Later syncs use the normal incremental cursor.
 
 ## Commands
 
@@ -87,4 +87,3 @@ python -m build
 - Only merchant text, MCC, amount band, and allowed categories are sent to OpenAI.
 - Account IDs, balances, IBANs, tokens, and raw statement payloads are not sent to OpenAI.
 - The language model cannot call spreadsheet write methods directly.
-

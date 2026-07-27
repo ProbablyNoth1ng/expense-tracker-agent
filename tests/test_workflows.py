@@ -1,8 +1,10 @@
 import unittest
-from datetime import UTC, date, datetime
+from collections import Counter
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import Mock
 
 from expense_agent.chat import ChatService
+from expense_agent.sheets import SheetsGateway
 from expense_agent.workflows import build_sync_graph
 
 
@@ -53,6 +55,79 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             graph.invoke({"account_ids": ["a"], "now": datetime(2026, 7, 3, tzinfo=UTC)})
         services.store.set_cursor.assert_not_called()
+        services.store.delete_proposal.assert_called_once()
+
+    def test_first_sync_backfills_31_days_and_skips_existing_monthly_expense(self):
+        services = Mock()
+        services.settings.initial_sync_date = date(2026, 7, 1)
+        services.settings.timezone = "Europe/Warsaw"
+        services.store.get_cursor.return_value = datetime(2026, 7, 18, tzinfo=UTC)
+        services.store.reconciliation_completed.return_value = False
+        services.store.reserve_transaction.return_value = True
+        now = datetime(2026, 7, 18, 18, tzinfo=UTC)
+        raw = Mock(
+            id="old", account_id="a", time=int(datetime(2026, 6, 20, 12, tzinfo=UTC).timestamp()),
+            description="Lidl", counter_name="", comment="", mcc=5411, amount=-1000,
+            operation_amount=-1000, currency_code=985, hold=False,
+        )
+        services.monobank.iter_statements.return_value = iter([raw])
+        services.fx.convert.return_value = (10.0, 1.0, date(2026, 6, 20))
+        key = SheetsGateway.expense_key(date(2026, 6, 20), "Lidl", 10.0)
+        services.sheets.monthly_expense_counts.return_value = Counter({key: 1})
+        services.sheets.expense_key.side_effect = SheetsGateway.expense_key
+
+        result = build_sync_graph(services).invoke({"account_ids": ["a"], "now": now})
+
+        statement_args = services.monobank.iter_statements.call_args.args
+        self.assertEqual(statement_args[1], now - timedelta(days=31))
+        services.sheets.stage_proposals.assert_called_once_with([])
+        services.store.mark_reconciliation_complete.assert_called_once_with(
+            "a", start=now - timedelta(days=31), end=now
+        )
+        self.assertEqual(result["new_count"], 0)
+        self.assertEqual(result["matched_existing_count"], 1)
+
+    def test_completed_reconciliation_uses_cursor_without_reading_monthly_sheets(self):
+        services = Mock()
+        services.settings.initial_sync_date = date(2026, 7, 1)
+        services.settings.timezone = "Europe/Warsaw"
+        cursor = datetime(2026, 7, 17, tzinfo=UTC)
+        services.store.get_cursor.return_value = cursor
+        services.store.reconciliation_completed.return_value = True
+        services.monobank.iter_statements.return_value = iter([])
+
+        build_sync_graph(services).invoke(
+            {"account_ids": ["a"], "now": datetime(2026, 7, 18, tzinfo=UTC)}
+        )
+
+        self.assertEqual(services.monobank.iter_statements.call_args.args[1], cursor)
+        services.sheets.monthly_expense_counts.assert_not_called()
+        services.store.mark_reconciliation_complete.assert_not_called()
+
+    def test_fetch_failure_releases_reservations_without_committing_progress(self):
+        services = Mock()
+        services.settings.initial_sync_date = date(2026, 7, 1)
+        services.settings.timezone = "Europe/Warsaw"
+        services.store.get_cursor.return_value = datetime(2026, 7, 18, tzinfo=UTC)
+        services.store.reconciliation_completed.return_value = False
+        services.store.reserve_transaction.return_value = True
+        raw = Mock(
+            id="t1", account_id="a", time=int(datetime(2026, 7, 17, tzinfo=UTC).timestamp()),
+            description="Lidl", counter_name="", comment="", mcc=5411, amount=-1000,
+            operation_amount=-1000, currency_code=985, hold=False,
+        )
+        services.monobank.iter_statements.return_value = iter([raw])
+        services.sheets.monthly_expense_counts.return_value = Counter()
+        services.fx.convert.side_effect = RuntimeError("NBP unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "NBP unavailable"):
+            build_sync_graph(services).invoke(
+                {"account_ids": ["a"], "now": datetime(2026, 7, 18, tzinfo=UTC)}
+            )
+
+        services.store.release_transaction.assert_called_once_with("t1")
+        services.store.set_cursor.assert_not_called()
+        services.store.mark_reconciliation_complete.assert_not_called()
 
 
 class ChatTests(unittest.TestCase):

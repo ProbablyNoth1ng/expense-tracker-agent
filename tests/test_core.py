@@ -93,6 +93,13 @@ class StorageTests(unittest.TestCase):
         self.store.upsert_merchant_rule("lidl", 5411, "Еда и продукты")
         self.assertEqual(self.store.find_merchant_rule("lidl", 5411), "Еда и продукты")
 
+    def test_reconciliation_marker_persists_per_account(self):
+        start = datetime(2026, 6, 17, tzinfo=UTC)
+        end = datetime(2026, 7, 18, tzinfo=UTC)
+        self.assertFalse(self.store.reconciliation_completed("acc"))
+        self.store.mark_reconciliation_complete("acc", start=start, end=end)
+        self.assertTrue(self.store.reconciliation_completed("acc"))
+
     def test_proposal_lifecycle_is_auditable(self):
         proposal_id = self.store.create_proposal(
             action="ADD", source_transaction_id="mono-1", payload={"amount_pln": 10.0}

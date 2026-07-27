@@ -84,7 +84,10 @@ def _sync(settings: Settings) -> int:
             services.backup.create(settings.spreadsheet_id)
             graph = build_sync_graph(services)
             result = graph.invoke({"account_ids": services.selected_accounts(), "now": datetime.now(tz=UTC)})
-            print(f"New proposals: {result.get('new_count', 0)}")
+            print(
+                f"New proposals: {result.get('new_count', 0)}; "
+                f"already in monthly sheets: {result.get('matched_existing_count', 0)}"
+            )
             return 0
         finally:
             services.close()
