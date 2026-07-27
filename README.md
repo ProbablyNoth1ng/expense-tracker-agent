@@ -7,7 +7,7 @@ The agent never writes imported data directly into monthly sheets. It creates pr
 ## What is implemented
 
 - Monobank personal API import from selected accounts.
-- Settled outgoing transactions only; incoming payments and holds are ignored.
+- Settled and held outgoing transactions are staged for review; incoming payments are ignored.
 - PLN conversion through the official NBP API when the original transaction is not PLN.
 - Deterministic merchant and MCC rules before `gpt-5.4-mini` fallback.
 - Automatic learning from approved merchant/category corrections.

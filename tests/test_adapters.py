@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, call
 
@@ -45,6 +45,20 @@ class MonobankTests(unittest.TestCase):
         list(client.iter_statements(["a"], datetime(2026, 7, 1, tzinfo=UTC), datetime(2026, 9, 1, tzinfo=UTC)))
         self.assertTrue(all(c.kwargs["headers"] == {"X-Token": "secret"} for c in transport.get.call_args_list))
         self.assertGreaterEqual(sleeper.call_count, 2)
+
+    def test_client_uses_unix_seconds_for_statement_window(self):
+        transport = Mock()
+        transport.get.return_value = Mock(status_code=200, json=lambda: [])
+        client = MonobankClient(token="secret", transport=transport, sleeper=Mock())
+        end = datetime(2026, 7, 19, 12, 34, 56, tzinfo=UTC)
+        start = end - timedelta(days=31)
+
+        list(client.iter_statements(["account-id"], start, end))
+
+        self.assertEqual(
+            transport.get.call_args.args[0],
+            "https://api.monobank.ua/personal/statement/account-id/1781786096/1784464496",
+        )
 
 
 class SheetsTests(unittest.TestCase):

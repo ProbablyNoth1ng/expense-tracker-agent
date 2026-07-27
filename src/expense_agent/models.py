@@ -50,6 +50,19 @@ class NormalizedTransaction:
     fingerprint: str
 
 
+@dataclass(frozen=True, slots=True)
+class DetectedExpense:
+    """Safe, user-facing summary of an outgoing settled transaction."""
+
+    outcome: Literal["NEW", "ALREADY_IN_DATABASE", "ALREADY_IN_SHEET"]
+    date: date
+    merchant: str
+    original_amount: float
+    original_currency: str
+    amount_pln: float | None = None
+    suggested_category: str | None = None
+
+
 @dataclass(slots=True)
 class ChangeProposal:
     id: str
@@ -65,4 +78,3 @@ class ChangeProposal:
     reason: str = ""
     confidence: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
-

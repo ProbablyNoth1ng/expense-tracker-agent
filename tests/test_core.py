@@ -49,7 +49,7 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(result.original_currency, "PLN")
         self.assertEqual(result.merchant, "Lidl")
 
-    def test_pending_and_incoming_transactions_are_ignored(self):
+    def test_held_outgoing_is_normalized_but_incoming_is_ignored(self):
         base = dict(
             id="x",
             account_id="a",
@@ -59,7 +59,7 @@ class NormalizationTests(unittest.TestCase):
             operation_amount=-100,
             currency_code=985,
         )
-        self.assertIsNone(normalize_transaction(RawTransaction(**base, amount=-100, hold=True)))
+        self.assertIsNotNone(normalize_transaction(RawTransaction(**base, amount=-100, hold=True)))
         self.assertIsNone(normalize_transaction(RawTransaction(**base, amount=100, hold=False)))
 
     def test_other_year_is_rejected(self):

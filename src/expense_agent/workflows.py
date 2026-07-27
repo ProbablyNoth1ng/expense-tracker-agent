@@ -6,7 +6,7 @@ from datetime import UTC, datetime, time, timedelta
 from typing import Any, TypedDict
 from zoneinfo import ZoneInfo
 
-from .models import ChangeProposal
+from .models import ChangeProposal, DetectedExpense
 from .normalization import normalize_transaction
 
 
@@ -16,6 +16,7 @@ class SyncState(TypedDict, total=False):
     applied: dict[str, int]
     proposals: list[ChangeProposal]
     cursor_updates: list[tuple[str, datetime]]
+    reconciliation_updates: list[tuple[str, datetime, datetime]]
     reconciliation_updates: list[tuple[str, datetime, datetime]]
     reserved: list[tuple[str, str]]
     new_count: int
@@ -166,8 +167,15 @@ def _stage_node(services: Any, state: SyncState) -> SyncState:
     if callable(mark_reconciliation):
         for account_id, start, end in state.get("reconciliation_updates", []):
             mark_reconciliation(account_id, start=start, end=end)
+    mark_reconciliation = getattr(services.store, "mark_reconciliation_complete", None)
+    if callable(mark_reconciliation):
+        for account_id, start, end in state.get("reconciliation_updates", []):
+            mark_reconciliation(account_id, start=start, end=end)
     services.notifier.notify(
         "Expense agent sync",
+        "New: "
+        f"{state.get('new_count', 0)}; existing: {state.get('matched_existing_count', 0)}; "
+        f"synced: {state.get('applied', {}).get('synced', 0)}",
         "New: "
         f"{state.get('new_count', 0)}; existing: {state.get('matched_existing_count', 0)}; "
         f"synced: {state.get('applied', {}).get('synced', 0)}",

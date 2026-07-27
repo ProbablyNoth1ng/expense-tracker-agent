@@ -1,11 +1,14 @@
 import os
+import io
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfoNotFoundError
 
-from expense_agent.cli import build_parser, run
+from expense_agent.cli import _configure_output_encoding, _print_detected_expenses, build_parser, run
+from expense_agent.models import DetectedExpense
 from expense_agent.notifications import WindowsNotifier
 from expense_agent.scheduler import build_task_xml
 
@@ -35,6 +38,60 @@ class NotificationTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_utf8_output_prevents_charmap_errors_for_transaction_text(self):
+        output = io.BytesIO()
+        error = io.BytesIO()
+        stdout = io.TextIOWrapper(output, encoding="cp1252", write_through=True)
+        stderr = io.TextIOWrapper(error, encoding="cp1252", write_through=True)
+        result = {
+            "detected_expenses": [
+                DetectedExpense(
+                    "NEW",
+                    date(2026, 7, 19),
+                    "\u017babka",
+                    42.5,
+                    "PLN",
+                    42.5,
+                    "\u0407\u0436\u0430 \u0456 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u0438",
+                )
+            ]
+        }
+        with (
+            patch("expense_agent.cli.sys.stdout", stdout),
+            patch("expense_agent.cli.sys.stderr", stderr),
+        ):
+            _configure_output_encoding()
+            _print_detected_expenses(result)
+            stdout.flush()
+
+        rendered = output.getvalue().decode("utf-8")
+        self.assertIn("\u017babka", rendered)
+        self.assertIn("\u0407\u0436\u0430 \u0456 \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u0438", rendered)
+
+    def test_sync_output_is_readable_and_contains_no_sensitive_identifiers(self):
+        result = {
+            "detected_expenses": [
+                DetectedExpense("NEW", date(2026, 7, 18), "Żabka", 42.5, "PLN", 42.5, "Їжа і продукти"),
+                DetectedExpense("ALREADY_IN_DATABASE", date(2026, 7, 17), "Steam", 39.99, "USD"),
+                DetectedExpense("ALREADY_IN_SHEET", date(2026, 7, 16), "Lidl", 10.0, "PLN", 10.0),
+            ],
+            "new_count": 1,
+            "already_in_database_count": 1,
+            "matched_existing_count": 1,
+        }
+        with patch("builtins.print") as printer:
+            _print_detected_expenses(result)
+
+        rendered = "\n".join(str(call.args[0]) if call.args else "" for call in printer.call_args_list)
+        self.assertIn("Żabka", rendered)
+        self.assertIn("Їжа і продукти", rendered)
+        self.assertIn("39.99 USD", rendered)
+        self.assertIn("Detected: 3", rendered)
+        self.assertNotIn("account-secret", rendered)
+        self.assertNotIn("transaction-secret", rendered)
+        self.assertNotIn("fingerprint", rendered)
+        self.assertNotIn("token", rendered.casefold())
+
     def test_parser_exposes_all_public_commands(self):
         parser = build_parser()
         for command in ("setup", "sync", "apply", "chat", "doctor", "install-schedule"):

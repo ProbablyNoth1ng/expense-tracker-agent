@@ -1,6 +1,8 @@
 import unittest
 from collections import Counter
 from datetime import UTC, date, datetime, timedelta
+from collections import Counter
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import Mock
 
 from expense_agent.chat import ChatService
@@ -9,6 +11,67 @@ from expense_agent.workflows import build_sync_graph
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_sync_reports_new_database_sheet_and_held_expenses_without_incoming(self):
+        services = Mock()
+        services.settings.initial_sync_date = date(2026, 7, 1)
+        services.settings.timezone = "Europe/Warsaw"
+        services.store.get_cursor.return_value = datetime(2026, 7, 17, tzinfo=UTC)
+        services.store.reconciliation_completed.return_value = False
+        services.store.reserve_transaction.side_effect = [True, False, True, True]
+        now = datetime(2026, 7, 18, 18, tzinfo=UTC)
+        timestamp = int(datetime(2026, 7, 18, 12, tzinfo=UTC).timestamp())
+        services.monobank.iter_statements.return_value = iter([
+            RawTransaction("new", "account-secret", timestamp, "Żabka", 5411, -4250, -4250, 985, False),
+            RawTransaction("database-secret", "account-secret", timestamp, "Steam", 5816, -3999, -3999, 840, False),
+            RawTransaction("sheet-secret", "account-secret", timestamp, "Lidl", 5411, -1000, -1000, 985, False),
+            RawTransaction("incoming-secret", "account-secret", timestamp, "Salary", 0, 10000, 10000, 985, False),
+            RawTransaction("held-secret", "account-secret", timestamp, "Pending", 0, -1000, -1000, 985, True),
+        ])
+        services.fx.convert.side_effect = [
+            (42.5, 1.0, date(2026, 7, 18)),
+            (10.0, 1.0, date(2026, 7, 18)),
+            (10.0, 1.0, date(2026, 7, 18)),
+        ]
+        services.categorizer.categorize.return_value = Mock(category="Їжа і продукти", confidence=0.95, reason="MCC")
+        sheet_key = SheetsGateway.expense_key(date(2026, 7, 18), "Lidl", 10.0)
+        services.sheets.monthly_expense_counts.return_value = Counter({sheet_key: 1})
+        services.sheets.expense_key.side_effect = SheetsGateway.expense_key
+
+        result = build_sync_graph(services).invoke({"account_ids": ["account-secret"], "now": now})
+
+        expenses = result["detected_expenses"]
+        self.assertEqual(
+            [expense.outcome for expense in expenses],
+            ["NEW", "ALREADY_IN_DATABASE", "ALREADY_IN_SHEET", "NEW"],
+        )
+        self.assertEqual(expenses[0].merchant, "Żabka")
+        self.assertEqual(expenses[0].suggested_category, "Їжа і продукти")
+        self.assertEqual(expenses[1].original_currency, "USD")
+        self.assertIsNone(expenses[1].amount_pln)
+        self.assertEqual(expenses[2].amount_pln, 10.0)
+        self.assertEqual(result["incoming_count"], 1)
+        self.assertEqual(result["included_held_count"], 1)
+        self.assertEqual(result["new_count"], 2)
+        self.assertTrue(result["proposals"][1].metadata["bank_hold"])
+        self.assertEqual(result["already_in_database_count"], 1)
+
+    def test_sync_reports_no_expenses_for_an_empty_api_result(self):
+        services = Mock()
+        services.settings.initial_sync_date = date(2026, 7, 1)
+        services.settings.timezone = "Europe/Warsaw"
+        services.store.get_cursor.return_value = None
+        services.store.reconciliation_completed.return_value = True
+        services.monobank.iter_statements.return_value = iter([])
+
+        result = build_sync_graph(services).invoke(
+            {"account_ids": ["a"], "now": datetime(2026, 7, 18, tzinfo=UTC)}
+        )
+
+        self.assertEqual(result["detected_expenses"], [])
+        self.assertEqual(result["new_count"], 0)
+        self.assertEqual(result["already_in_database_count"], 0)
+        self.assertEqual(result["matched_existing_count"], 0)
+
     def test_sync_applies_before_fetch_and_commits_cursor_after_stage(self):
         events = []
         services = Mock()

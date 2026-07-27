@@ -15,7 +15,15 @@ from .config import Settings
 from .locking import ProcessLock
 from .logging_utils import configure_logging
 from .scheduler import install_task
-from .workflows import build_sync_graph
+from .workflows import SyncState, build_sync_graph
+
+
+def _configure_output_encoding() -> None:
+    """Ensure transaction descriptions and categories print on legacy Windows consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -93,6 +101,33 @@ def _sync(settings: Settings) -> int:
             services.close()
 
 
+def _print_detected_expenses(result: SyncState) -> None:
+    expenses = result.get("detected_expenses", [])
+    print("Detected expenses:")
+    for expense in expenses:
+        original = f"{expense.original_amount:.2f} {expense.original_currency}"
+        converted = (
+            f" ({expense.amount_pln:.2f} PLN)"
+            if expense.amount_pln is not None and expense.original_currency != "PLN"
+            else ""
+        )
+        category = f"  {expense.suggested_category}" if expense.suggested_category else ""
+        print(
+            f"{expense.outcome:<21} {expense.date.isoformat()}  {expense.merchant:<20} "
+            f"{original}{converted}{category}"
+        )
+    print()
+    print(f"Detected: {len(expenses)}")
+    print(f"New proposals: {result.get('new_count', 0)}")
+    print(f"Already in database: {result.get('already_in_database_count', 0)}")
+    print(f"Already in monthly sheets: {result.get('matched_existing_count', 0)}")
+    if result.get("incoming_count", 0) or result.get("included_held_count", 0):
+        print(
+            f"Ignored incoming: {result.get('incoming_count', 0)}; "
+            f"included held outgoing: {result.get('included_held_count', 0)}"
+        )
+
+
 def _apply(settings: Settings) -> int:
     with ProcessLock(settings.database_path.parent / "agent.lock"):
         services = build_services(settings)
@@ -126,6 +161,7 @@ def _chat(settings: Settings, text: str) -> int:
 
 
 def run(argv: Sequence[str] | None = None) -> int:
+    _configure_output_encoding()
     args = build_parser().parse_args(argv)
     settings = Settings.from_env()
     logger = configure_logging(
