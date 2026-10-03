@@ -97,6 +97,9 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertLess(events.index("apply"), events.index("fetch"))
         self.assertLess(events.index("stage"), events.index("cursor"))
+        services.notifier.notify.assert_called_once_with(
+            "Expense agent sync", "New: 1; existing: 0; synced: 0"
+        )
         self.assertEqual(result["new_count"], 1)
 
     def test_cursor_is_not_committed_when_staging_fails(self):
@@ -223,10 +226,10 @@ class ChatTests(unittest.TestCase):
         }
         sheets = Mock()
         sheets.find_expense_candidates.return_value = [
-            {"sheet": "Lipiec", "row": 12, "values": ["2026-07-15", "Еда и продукты", "McDonald's", 24.0]}
+            {"sheet": "July", "row": 12, "values": ["2026-07-15", "Еда и продукты", "McDonald's", 24.0]}
         ]
         proposal = ChatService(parser=parser, sheets=sheets).create_proposal("change McDonald's to 30 zł")
-        self.assertEqual(proposal.target["sheet"], "Lipiec")
+        self.assertEqual(proposal.target["sheet"], "July")
         self.assertEqual(proposal.target["expected"][3], 24.0)
 
 

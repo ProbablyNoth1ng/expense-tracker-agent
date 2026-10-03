@@ -7,14 +7,15 @@ from unittest.mock import Mock, call
 from googleapiclient.errors import HttpError
 
 from expense_agent.backups import BackupService
+from expense_agent.constants import CATEGORIES, ENGLISH_MONTH_SHEETS, POLISH_MONTH_SHEETS
 from expense_agent.models import ChangeProposal
 from expense_agent.monobank import MonobankClient, statement_windows
-from expense_agent.constants import CATEGORIES, MONTH_SHEETS
 from expense_agent.sheets import (
     REVIEW_HEADERS,
     SheetsGateway,
     extend_chart_ranges,
     proposal_to_review_row,
+    resolve_month_sheets,
     validate_template_metadata,
 )
 
@@ -77,15 +78,17 @@ class SheetsTests(unittest.TestCase):
         ]
 
     @staticmethod
-    def _migration_metadata(*, total_row: int = 16):
+    def _migration_metadata(
+        *, total_row: int = 16, month_sheets: dict[int, str] = ENGLISH_MONTH_SHEETS
+    ):
         sheets = []
-        for sheet_id, title in enumerate(MONTH_SHEETS.values(), start=2):
+        for sheet_id, title in enumerate(month_sheets.values(), start=2):
             sheets.append({
                 "properties": {"title": title, "sheetId": sheet_id},
                 "data": [{
                     "startRow": total_row - 1,
                     "startColumn": 5,
-                    "rowData": [{"values": [{"userEnteredValue": {"stringValue": "RAZEM"}}]}],
+                    "rowData": [{"values": [{"userEnteredValue": {"stringValue": "Total"}}]}],
                 }],
             })
         sheets.insert(0, {
@@ -93,7 +96,7 @@ class SheetsTests(unittest.TestCase):
             "data": [{
                 "startRow": total_row - 1,
                 "startColumn": 0,
-                "rowData": [{"values": [{"userEnteredValue": {"stringValue": "ŁĄCZNIE"}}]}],
+                "rowData": [{"values": [{"userEnteredValue": {"stringValue": "Monthly total"}}]}],
             }],
         })
         sheets.extend([
@@ -101,6 +104,12 @@ class SheetsTests(unittest.TestCase):
             {"properties": {"title": "Agent Log", "sheetId": 21}},
         ])
         return {"sheets": sheets}
+
+    def _gateway(self, service: Mock, **kwargs: object) -> SheetsGateway:
+        service.spreadsheets.return_value.get.return_value.execute.return_value = (
+            self._migration_metadata()
+        )
+        return SheetsGateway(service=service, spreadsheet_id="sheet-id", **kwargs)
 
     def _migrate_with_metadata(self, metadata):
         service = Mock()
@@ -117,7 +126,7 @@ class SheetsTests(unittest.TestCase):
         )
         updates = value_call.kwargs["body"]["data"]
         by_range = {update["range"]: update["values"] for update in updates}
-        january = MONTH_SHEETS[1]
+        january = ENGLISH_MONTH_SHEETS[1]
 
         self.assertEqual(by_range[f"'{january}'!F4:F17"], [[category] for category in CATEGORIES])
         self.assertEqual(
@@ -128,12 +137,12 @@ class SheetsTests(unittest.TestCase):
         self.assertEqual(by_range["Podsumowanie!A4:A17"], [[category] for category in CATEGORIES])
         self.assertEqual(
             by_range["Podsumowanie!B4:N4"][0],
-            [f"=IFERROR('{MONTH_SHEETS[month]}'!G4;0)" for month in range(1, 13)]
+            [f"=IFERROR('{ENGLISH_MONTH_SHEETS[month]}'!G4;0)" for month in range(1, 13)]
             + ["=SUM(B4:M4)"],
         )
         self.assertEqual(
             by_range["Podsumowanie!A18:N18"][0],
-            ["💰  ŁĄCZNIE W MIESIĄCU"]
+            ["Monthly total"]
             + [f"=SUM({column}4:{column}17)" for column in "BCDEFGHIJKLM"]
             + ["=SUM(N4:N17)"],
         )
@@ -158,6 +167,50 @@ class SheetsTests(unittest.TestCase):
             next(item for item in validations if item["range"]["sheetId"] == 20 and item["range"]["startColumnIndex"] == 3)["rule"]["condition"]["values"],
             category_values,
         )
+
+    def test_migration_uses_polish_tabs_for_formulas_and_chart_handling(self):
+        metadata = self._migration_metadata(month_sheets=POLISH_MONTH_SHEETS)
+        september = next(
+            sheet for sheet in metadata["sheets"] if sheet["properties"]["title"] == "Wrzesień"
+        )
+        september["charts"] = [{
+            "chartId": 91,
+            "spec": {"ranges": [{
+                "sheetId": 10,
+                "startRowIndex": 3,
+                "endRowIndex": 11,
+                "startColumnIndex": 5,
+                "endColumnIndex": 6,
+            }]},
+        }]
+        spreadsheets = self._migrate_with_metadata(metadata)
+        value_call = next(
+            call for call in spreadsheets.values.return_value.batchUpdate.call_args_list
+            if "data" in call.kwargs["body"]
+        )
+        updates = {
+            update["range"]: update["values"] for update in value_call.kwargs["body"]["data"]
+        }
+        self.assertIn("'Wrzesień'!F4:F17", updates)
+        self.assertEqual(
+            updates["Podsumowanie!B4:N4"][0][8], "=IFERROR('Wrzesień'!G4;0)"
+        )
+
+        request_call = next(
+            call for call in spreadsheets.batchUpdate.call_args_list
+            if any("setDataValidation" in request for request in call.kwargs["body"].get("requests", []))
+        )
+        validations = [
+            request["setDataValidation"] for request in request_call.kwargs["body"]["requests"]
+            if "setDataValidation" in request
+        ]
+        self.assertTrue(any(item["range"]["sheetId"] == 10 for item in validations))
+        chart_updates = [
+            request["updateChartSpec"]
+            for request in request_call.kwargs["body"]["requests"]
+            if "updateChartSpec" in request
+        ]
+        self.assertEqual(chart_updates[0]["chartId"], 91)
 
     def test_migration_copies_existing_formats_to_new_category_and_total_rows(self):
         spreadsheets = self._migrate_with_metadata(self._migration_metadata(total_row=16))
@@ -276,7 +329,7 @@ class SheetsTests(unittest.TestCase):
         self.assertEqual(
             format_calls[0].kwargs["ranges"],
             [
-                *[f"'{title}'!F4:G18" for title in MONTH_SHEETS.values()],
+                *[f"'{title}'!F4:G18" for title in ENGLISH_MONTH_SHEETS.values()],
                 "Podsumowanie!A4:N18",
             ],
         )
@@ -294,9 +347,30 @@ class SheetsTests(unittest.TestCase):
         self.assertFalse(any("copyPaste" in request for request in request_call.kwargs["body"]["requests"]))
 
     def test_template_requires_summary_and_all_months(self):
-        titles = ["Podsumowanie", "Styczeń"]
-        with self.assertRaisesRegex(ValueError, "missing sheets"):
+        titles = ["Podsumowanie", "January"]
+        with self.assertRaisesRegex(ValueError, "complete Polish or English"):
             validate_template_metadata(titles)
+
+    def test_resolve_month_sheets_accepts_complete_polish_tabs(self):
+        self.assertEqual(resolve_month_sheets(POLISH_MONTH_SHEETS.values()), POLISH_MONTH_SHEETS)
+        self.assertEqual(
+            validate_template_metadata(["Podsumowanie", *POLISH_MONTH_SHEETS.values()]),
+            POLISH_MONTH_SHEETS,
+        )
+
+    def test_resolve_month_sheets_accepts_complete_english_tabs(self):
+        self.assertEqual(resolve_month_sheets(ENGLISH_MONTH_SHEETS.values()), ENGLISH_MONTH_SHEETS)
+
+    def test_resolve_month_sheets_prefers_polish_when_both_sets_exist(self):
+        self.assertEqual(
+            resolve_month_sheets([*ENGLISH_MONTH_SHEETS.values(), *POLISH_MONTH_SHEETS.values()]),
+            POLISH_MONTH_SHEETS,
+        )
+
+    def test_resolve_month_sheets_rejects_mixed_or_incomplete_tabs(self):
+        titles = [*POLISH_MONTH_SHEETS.values()[:-1], ENGLISH_MONTH_SHEETS[12]]
+        with self.assertRaisesRegex(ValueError, "complete Polish or English"):
+            resolve_month_sheets(titles)
 
     def test_review_row_contains_visible_and_idempotency_fields(self):
         proposal = ChangeProposal(
@@ -359,7 +433,7 @@ class SheetsTests(unittest.TestCase):
             {"values": [["2026-06-30", "Food", "  LIDL ", 10.0]]},
             {"values": [["2026-07-01", "Food", "Lidl", "10.00"]]},
         ]
-        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway = self._gateway(service)
 
         counts = gateway.monthly_expense_counts(start=date(2026, 6, 30), end=date(2026, 7, 1))
 
@@ -367,10 +441,30 @@ class SheetsTests(unittest.TestCase):
         self.assertEqual(counts[key], 1)
         self.assertEqual(len(values.get.call_args_list), 2)
 
+    def test_monthly_reads_and_candidate_searches_use_cached_polish_tabs(self):
+        service = Mock()
+        spreadsheets = service.spreadsheets.return_value
+        spreadsheets.get.return_value.execute.return_value = self._migration_metadata(
+            month_sheets=POLISH_MONTH_SHEETS
+        )
+        values = spreadsheets.values.return_value
+        values.get.return_value.execute.side_effect = [
+            {"values": [["2026-09-01", "Food", "Lidl", 10.0]]}
+            for _ in range(13)
+        ]
+        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+
+        gateway.monthly_expense_counts(start=date(2026, 9, 1), end=date(2026, 9, 1))
+        gateway.find_expense_candidates("Lidl")
+
+        self.assertEqual(spreadsheets.get.call_count, 1)
+        self.assertEqual(values.get.call_args_list[0].kwargs["range"], "'Wrzesień'!A4:D")
+        self.assertIn("'Wrzesień'!A4:D", [call.kwargs["range"] for call in values.get.call_args_list])
+
     def test_apply_mirrors_review_and_final_statuses_to_database(self):
         service = Mock()
         store = Mock()
-        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id", store=store)
+        gateway = self._gateway(service, store=store)
         gateway.read_review_rows = Mock(return_value=[
             ["Rejected", "ADD", "2026-07-16", "Food", "Old", 1.0, "monobank", "", "", "", "p-rejected"],
             ["Approved", "ADD", "2026-07-17", "Food", "Lidl", 12.34, "monobank", "", "", "", "p-approved", "t1", "fp", "{}"],
@@ -412,14 +506,14 @@ class SheetsTests(unittest.TestCase):
         values.batchGet.return_value.execute.return_value = {
             "valueRanges": [{"values": [["2026-07-01", "Food", "Lidl", 12.34]]}]
         }
-        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway = self._gateway(service)
         gateway.read_review_rows = Mock(return_value=[
             self._approved_row(proposal_id="p-add", amount="22,5"),
             self._approved_row(
                 proposal_id="p-edit",
                 action="EDIT",
                 amount="1 234,56",
-                target='{"sheet": "Lipiec", "row": 8, "expected": ["2026-07-01", "Food", "Lidl", 12.34]}',
+                target='{"sheet": "July", "row": 8, "expected": ["2026-07-01", "Food", "Lidl", 12.34]}',
             ),
         ])
 
@@ -428,7 +522,7 @@ class SheetsTests(unittest.TestCase):
         self.assertEqual(result, {"synced": 2, "conflicts": 0, "errors": 0})
         monthly_append = next(
             call for call in values.append.call_args_list
-            if call.kwargs["range"] == "'Lipiec'!A4:D"
+            if call.kwargs["range"] == "'July'!A4:D"
         )
         self.assertEqual(monthly_append.kwargs["body"]["values"][0][3], 22.5)
         self.assertIsInstance(monthly_append.kwargs["body"]["values"][0][3], float)
@@ -439,9 +533,29 @@ class SheetsTests(unittest.TestCase):
         self.assertEqual(edit_batch.kwargs["body"]["data"][0]["values"][0][3], 1234.56)
         self.assertIsInstance(edit_batch.kwargs["body"]["data"][0]["values"][0][3], float)
 
+    def test_apply_targets_september_in_the_resolved_tab_language(self):
+        for month_sheets, expected_range in (
+            (POLISH_MONTH_SHEETS, "'Wrzesień'!A4:D"),
+            (ENGLISH_MONTH_SHEETS, "'September'!A4:D"),
+        ):
+            with self.subTest(expected_range=expected_range):
+                service = Mock()
+                service.spreadsheets.return_value.get.return_value.execute.return_value = (
+                    self._migration_metadata(month_sheets=month_sheets)
+                )
+                gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+                gateway.read_review_rows = Mock(return_value=[
+                    self._approved_row(proposal_id="p-september", transaction_date="2026-09-17")
+                ])
+
+                gateway.apply_approved()
+
+                append = service.spreadsheets.return_value.values.return_value.append
+                self.assertEqual(append.call_args.kwargs["range"], expected_range)
+
     def test_apply_marks_malformed_amount_as_error_and_logs_the_row_reason(self):
         service = Mock()
-        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway = self._gateway(service)
         gateway.read_review_rows = Mock(return_value=[
             self._approved_row(proposal_id="p-invalid", amount="12,34,56"),
         ])
@@ -452,7 +566,7 @@ class SheetsTests(unittest.TestCase):
         self.assertEqual(result, {"synced": 0, "conflicts": 0, "errors": 1})
         monthly_writes = [
             call for call in service.spreadsheets.return_value.values.return_value.append.call_args_list
-            if call.kwargs["range"] == "'Lipiec'!A4:D"
+            if call.kwargs["range"] == "'July'!A4:D"
         ]
         self.assertEqual(monthly_writes, [])
         self.assertTrue(any("Review row 2" in message for message in captured.output))
@@ -471,10 +585,10 @@ class SheetsTests(unittest.TestCase):
             self._approved_row(
                 proposal_id="p-edit",
                 action="EDIT",
-                target='{"sheet": "Lipiec", "row": 8, "expected": ["2026-07-01", "Food", "Lidl", 12.34]}',
+                target='{"sheet": "July", "row": 8, "expected": ["2026-07-01", "Food", "Lidl", 12.34]}',
             )
         )
-        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway = self._gateway(service)
         gateway.read_review_rows = Mock(return_value=rows)
 
         result = gateway.apply_approved()
@@ -509,9 +623,8 @@ class SheetsTests(unittest.TestCase):
         service = Mock()
         values = service.spreadsheets.return_value.values.return_value
         values.append.return_value.execute.side_effect = [quota_error, None, None]
-        gateway = SheetsGateway(
-            service=service,
-            spreadsheet_id="sheet-id",
+        gateway = self._gateway(
+            service,
             sleeper=clock.sleep,
             monotonic=clock.monotonic,
             random_float=lambda: 0.0,
@@ -532,7 +645,7 @@ class SheetsTests(unittest.TestCase):
             self._approved_row(
                 proposal_id="p-edit",
                 action="EDIT",
-                target='{"sheet": "Lipiec", "row": 8, "expected": ["2026-07-01", "Food", "Lidl", 12.34]}',
+                target='{"sheet": "July", "row": 8, "expected": ["2026-07-01", "Food", "Lidl", 12.34]}',
             )
         ])
 
@@ -559,9 +672,8 @@ class SheetsTests(unittest.TestCase):
         values.append.return_value.execute.side_effect = lambda: (_ for _ in ()).throw(
             HttpError(Mock(status=429, reason="Too Many Requests"), b"quota exceeded")
         )
-        gateway = SheetsGateway(
-            service=service,
-            spreadsheet_id="sheet-id",
+        gateway = self._gateway(
+            service,
             sleeper=clock.sleep,
             monotonic=clock.monotonic,
             random_float=lambda: 0.0,
@@ -593,7 +705,7 @@ class SheetsTests(unittest.TestCase):
 
     def test_approved_add_overwrites_next_table_row_without_shifting_summary(self):
         service = Mock()
-        gateway = SheetsGateway(service=service, spreadsheet_id="sheet-id")
+        gateway = self._gateway(service)
         gateway.read_review_rows = Mock(
             return_value=[
                 [
@@ -621,7 +733,7 @@ class SheetsTests(unittest.TestCase):
         monthly_append = next(
             call
             for call in service.spreadsheets.return_value.values.return_value.append.call_args_list
-            if call.kwargs["range"] == "'Lipiec'!A4:D"
+            if call.kwargs["range"] == "'July'!A4:D"
         )
         self.assertEqual(monthly_append.kwargs["insertDataOption"], "OVERWRITE")
 
@@ -746,7 +858,7 @@ class SheetsTests(unittest.TestCase):
                 {"chartId": 10, "spec": summary_horizontal},
                 {"chartId": 11, "spec": summary_categories},
             ]},
-            {"properties": {"title": MONTH_SHEETS[1], "sheetId": 2}, "charts": [
+            {"properties": {"title": ENGLISH_MONTH_SHEETS[1], "sheetId": 2}, "charts": [
                 {"chartId": 20, "spec": monthly_categories},
                 {"chartId": 21, "spec": monthly_unrelated},
                 {"chartId": 22, "spec": monthly_shifted_daily},
@@ -754,7 +866,7 @@ class SheetsTests(unittest.TestCase):
         ]
         sheets.extend(
             {"properties": {"title": title, "sheetId": index}}
-            for index, title in enumerate(list(MONTH_SHEETS.values())[1:], start=3)
+            for index, title in enumerate(list(ENGLISH_MONTH_SHEETS.values())[1:], start=3)
         )
         sheets.extend([
             {"properties": {"title": "Review", "sheetId": 20}},

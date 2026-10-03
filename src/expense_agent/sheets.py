@@ -7,15 +7,15 @@ import math
 import random
 import re
 import time
-from collections import Counter
 from calendar import monthrange
+from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Iterable, cast
 
 from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 
-from .constants import CATEGORIES, MONTH_SHEETS, REVIEW_STATUSES
+from .constants import CATEGORIES, ENGLISH_MONTH_SHEETS, POLISH_MONTH_SHEETS, REVIEW_STATUSES
 from .models import ChangeProposal
 
 logger = logging.getLogger(__name__)
@@ -112,14 +112,16 @@ def _format_copy_request(
     }
 
 
-def format_copy_requests(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+def format_copy_requests(
+    metadata: dict[str, Any], *, month_sheets: dict[int, str]
+) -> list[dict[str, Any]]:
     requests: list[dict[str, Any]] = []
     for sheet in metadata.get("sheets", []):
         title = sheet["properties"]["title"]
-        if title in MONTH_SHEETS.values():
-            label, column, start_column, end_column = "RAZEM", 5, 5, 7
+        if title in month_sheets.values():
+            label, column, start_column, end_column = "Total", 5, 5, 7
         elif title == "Podsumowanie":
-            label, column, start_column, end_column = "ŁĄCZNIE", 0, 0, 14
+            label, column, start_column, end_column = "Monthly total", 0, 0, 14
         else:
             continue
         old_total_row = _find_total_label_row(sheet, column=column, label=label)
@@ -151,12 +153,27 @@ def format_copy_requests(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     return requests
 
 
-def validate_template_metadata(titles: Iterable[str]) -> None:
+def resolve_month_sheets(titles: Iterable[str]) -> dict[int, str]:
     available = set(titles)
-    required = {"Podsumowanie", *MONTH_SHEETS.values()}
-    missing = sorted(required - available)
-    if missing:
-        raise ValueError(f"Template is missing sheets: {', '.join(missing)}")
+    polish_titles = set(POLISH_MONTH_SHEETS.values())
+    english_titles = set(ENGLISH_MONTH_SHEETS.values())
+    if polish_titles <= available:
+        return dict(POLISH_MONTH_SHEETS)
+    if english_titles <= available:
+        return dict(ENGLISH_MONTH_SHEETS)
+    missing_polish = ", ".join(sorted(polish_titles - available))
+    missing_english = ", ".join(sorted(english_titles - available))
+    raise ValueError(
+        "Template must contain a complete Polish or English month-tab set; "
+        f"missing Polish: {missing_polish or 'none'}; missing English: {missing_english or 'none'}"
+    )
+
+
+def validate_template_metadata(titles: Iterable[str]) -> dict[int, str]:
+    available = set(titles)
+    if "Podsumowanie" not in available:
+        raise ValueError("Template is missing sheet: Podsumowanie")
+    return resolve_month_sheets(available)
 
 
 def proposal_to_review_row(proposal: ChangeProposal) -> list[Any]:
@@ -243,6 +260,7 @@ class SheetsGateway:
         self.sleeper = sleeper
         self.monotonic = monotonic
         self.random_float = random_float
+        self._month_sheets: dict[int, str] | None = None
 
     def metadata(self) -> dict[str, Any]:
         return cast(
@@ -254,10 +272,11 @@ class SheetsGateway:
         )
 
     def _category_layout_metadata(self) -> dict[str, Any]:
+        month_sheets = self._resolved_month_sheets()
         ranges = [
             *[
                 f"'{title}'!F{CATEGORY_START_ROW}:G{CATEGORY_TOTAL_ROW}"
-                for title in MONTH_SHEETS.values()
+                for title in month_sheets.values()
             ],
             f"Podsumowanie!A{CATEGORY_START_ROW}:N{CATEGORY_TOTAL_ROW}",
         ]
@@ -270,9 +289,17 @@ class SheetsGateway:
             raise TypeError("category layout metadata must be a mapping")
         return cast(dict[str, Any], result)
 
+    def _resolved_month_sheets(self, metadata: dict[str, Any] | None = None) -> dict[int, str]:
+        if self._month_sheets is None:
+            metadata = self.metadata() if metadata is None else metadata
+            self._month_sheets = validate_template_metadata(
+                sheet["properties"]["title"] for sheet in metadata.get("sheets", [])
+            )
+        return self._month_sheets
+
     def validate_template(self) -> dict[str, Any]:
         metadata = self.metadata()
-        validate_template_metadata(sheet["properties"]["title"] for sheet in metadata.get("sheets", []))
+        self._resolved_month_sheets(metadata)
         return metadata
 
     def _values(self) -> Any:
@@ -313,7 +340,7 @@ class SheetsGateway:
 
     def migrate_template(self) -> None:
         metadata = self.metadata()
-        validate_template_metadata(sheet["properties"]["title"] for sheet in metadata.get("sheets", []))
+        month_sheets = self._resolved_month_sheets(metadata)
         title_to_sheet = {sheet["properties"]["title"]: sheet for sheet in metadata["sheets"]}
         requests: list[dict[str, Any]] = []
         if "Review" not in title_to_sheet:
@@ -325,7 +352,9 @@ class SheetsGateway:
                 spreadsheetId=self.spreadsheet_id, body={"requests": requests}
             ).execute()
 
-        formatting_requests = format_copy_requests(self._category_layout_metadata())
+        formatting_requests = format_copy_requests(
+            self._category_layout_metadata(), month_sheets=month_sheets
+        )
         if formatting_requests:
             self.service.spreadsheets().batchUpdate(
                 spreadsheetId=self.spreadsheet_id, body={"requests": formatting_requests}
@@ -335,14 +364,14 @@ class SheetsGateway:
             {"range": "Review!A1:N1", "values": [list(REVIEW_HEADERS)]},
             {"range": "'Agent Log'!A1:G1", "values": [list(AGENT_LOG_HEADERS)]},
         ]
-        for title in MONTH_SHEETS.values():
+        for title in month_sheets.values():
             category_rows = [[category] for category in CATEGORIES]
             formulas = [[f'=IFERROR(SUMIF(B$4:B;F{row};D$4:D);0)'] for row in range(CATEGORY_START_ROW, CATEGORY_LAST_ROW + 1)]
             updates.extend(
                 [
                     {"range": f"'{title}'!F{CATEGORY_START_ROW}:F{CATEGORY_LAST_ROW}", "values": category_rows},
                     {"range": f"'{title}'!G{CATEGORY_START_ROW}:G{CATEGORY_LAST_ROW}", "values": formulas},
-                    {"range": f"'{title}'!F{CATEGORY_TOTAL_ROW}:G{CATEGORY_TOTAL_ROW}", "values": [["💰  RAZEM", f"=SUM(G{CATEGORY_START_ROW}:G{CATEGORY_LAST_ROW})"]]},
+                    {"range": f"'{title}'!F{CATEGORY_TOTAL_ROW}:G{CATEGORY_TOTAL_ROW}", "values": [["Total", f"=SUM(G{CATEGORY_START_ROW}:G{CATEGORY_LAST_ROW})"]]},
                     {"range": f"'{title}'!D2", "values": [["=SUM(D4:D)"]]},
                 ]
             )
@@ -350,13 +379,13 @@ class SheetsGateway:
         updates.append({"range": f"Podsumowanie!A{CATEGORY_START_ROW}:A{CATEGORY_LAST_ROW}", "values": summary_categories})
         for row in range(CATEGORY_START_ROW, CATEGORY_LAST_ROW + 1):
             summary_formulas = [
-                f"=IFERROR('{MONTH_SHEETS[month]}'!G{row};0)" for month in range(1, 13)
+                f"=IFERROR('{month_sheets[month]}'!G{row};0)" for month in range(1, 13)
             ]
             summary_formulas.append(f"=SUM(B{row}:M{row})")
             updates.append(
                 {"range": f"Podsumowanie!B{row}:N{row}", "values": [summary_formulas]}
             )
-        updates.append({"range": f"Podsumowanie!A{CATEGORY_TOTAL_ROW}:N{CATEGORY_TOTAL_ROW}", "values": [["💰  ŁĄCZNIE W MIESIĄCU", *[f"=SUM({column}{CATEGORY_START_ROW}:{column}{CATEGORY_LAST_ROW})" for column in "BCDEFGHIJKLM"], f"=SUM(N{CATEGORY_START_ROW}:N{CATEGORY_LAST_ROW})"]]})
+        updates.append({"range": f"Podsumowanie!A{CATEGORY_TOTAL_ROW}:N{CATEGORY_TOTAL_ROW}", "values": [["Monthly total", *[f"=SUM({column}{CATEGORY_START_ROW}:{column}{CATEGORY_LAST_ROW})" for column in "BCDEFGHIJKLM"], f"=SUM(N{CATEGORY_START_ROW}:N{CATEGORY_LAST_ROW})"]]})
         self._values().batchUpdate(
             spreadsheetId=self.spreadsheet_id,
             body={"valueInputOption": "USER_ENTERED", "data": updates},
@@ -364,13 +393,13 @@ class SheetsGateway:
 
         refreshed = self.metadata()
         requests = []
-        title_to_month = {title: month for month, title in MONTH_SHEETS.items()}
+        title_to_month = {title: month for month, title in month_sheets.items()}
         for sheet in refreshed.get("sheets", []):
             title = sheet["properties"]["title"]
             sheet_id = sheet["properties"]["sheetId"]
             chart_columns: AbstractSet[int] = frozenset()
             daily_chart_end_row: int | None = None
-            if title in MONTH_SHEETS.values():
+            if title in month_sheets.values():
                 chart_columns = frozenset({5, 6})
                 daily_chart_end_row = CATEGORY_START_ROW - 1 + monthrange(
                     2026, title_to_month[title]
@@ -485,7 +514,7 @@ class SheetsGateway:
         for year, month in months:
             if year != 2026:
                 continue
-            title = MONTH_SHEETS[month]
+            title = self._resolved_month_sheets()[month]
             values = self._values().get(
                 spreadsheetId=self.spreadsheet_id, range=f"'{title}'!A4:D"
             ).execute().get("values", [])
@@ -565,7 +594,7 @@ class SheetsGateway:
                     transaction_date.isoformat(), padded[3], padded[4], self.parse_amount_pln(padded[5])
                 ]]
                 if action == "ADD":
-                    target_sheet = MONTH_SHEETS[transaction_date.month]
+                    target_sheet = self._resolved_month_sheets()[transaction_date.month]
                     outcome["target_sheet"] = target_sheet
                     adds.setdefault(target_sheet, []).extend(values)
                 elif action == "EDIT":
@@ -724,7 +753,7 @@ class SheetsGateway:
     def find_expense_candidates(self, query: str) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         needle = query.casefold()
-        for title in MONTH_SHEETS.values():
+        for title in self._resolved_month_sheets().values():
             values = self._values().get(
                 spreadsheetId=self.spreadsheet_id, range=f"'{title}'!A4:D"
             ).execute().get("values", [])

@@ -26,7 +26,7 @@ The requested scopes allow spreadsheet edits and read-only Drive export for loca
 
 `expense-agent setup` performs these operations after creating a local XLSX backup:
 
-- validates `Podsumowanie` and all 12 Polish month tabs;
+- validates `Podsumowanie` and either all 12 Polish month tabs or all 12 English month tabs;
 - adds a visible `Review` tab;
 - adds a hidden `Agent Log` tab;
 - standardizes the 12 approved categories;
@@ -35,4 +35,3 @@ The requested scopes allow spreadsheet edits and read-only Drive export for loca
 - extends category chart source ranges.
 
 Run `setup --dry-run` first. It validates access without changing the spreadsheet.
-

@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 from expense_agent.categorization import Categorizer, CategoryDecision, LangChainCategoryModel
 from expense_agent.config import Settings
-from expense_agent.constants import CATEGORIES, MONTH_SHEETS
+from expense_agent.constants import CATEGORIES, ENGLISH_MONTH_SHEETS, POLISH_MONTH_SHEETS
 from expense_agent.fx import NbpClient, convert_to_pln
 from expense_agent.models import RawTransaction
 from expense_agent.normalization import normalize_transaction
@@ -25,7 +25,8 @@ class ConfigTests(unittest.TestCase):
     def test_category_order_and_months_are_stable(self):
         self.assertEqual(len(CATEGORIES), 14)
         self.assertEqual(CATEGORIES[-4:], ("Прочее", "Для дома", "Переводы", "Игры"))
-        self.assertEqual(MONTH_SHEETS[7], "Lipiec")
+        self.assertEqual(ENGLISH_MONTH_SHEETS[7], "July")
+        self.assertEqual(POLISH_MONTH_SHEETS[7], "Lipiec")
 
 
 class NormalizationTests(unittest.TestCase):

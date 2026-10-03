@@ -168,14 +168,8 @@ def _stage_node(services: Any, state: SyncState) -> SyncState:
         for account_id, start, end in state.get("reconciliation_updates", []):
             mark_reconciliation(account_id, start=start, end=end)
     mark_reconciliation = getattr(services.store, "mark_reconciliation_complete", None)
-    if callable(mark_reconciliation):
-        for account_id, start, end in state.get("reconciliation_updates", []):
-            mark_reconciliation(account_id, start=start, end=end)
     services.notifier.notify(
         "Expense agent sync",
-        "New: "
-        f"{state.get('new_count', 0)}; existing: {state.get('matched_existing_count', 0)}; "
-        f"synced: {state.get('applied', {}).get('synced', 0)}",
         "New: "
         f"{state.get('new_count', 0)}; existing: {state.get('matched_existing_count', 0)}; "
         f"synced: {state.get('applied', {}).get('synced', 0)}",

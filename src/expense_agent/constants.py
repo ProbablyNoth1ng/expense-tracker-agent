@@ -9,7 +9,7 @@ CATEGORIES = (
     "Здоровье / аптека",
     "Кафе и рестораны",
     "Бытовые штуки",
-    "Налоги, зус, буг",
+    "Зус",
     "Подписки",
     "Прочее",
     "Для дома",
@@ -17,7 +17,7 @@ CATEGORIES = (
     "Игры",
 )
 
-MONTH_SHEETS = {
+POLISH_MONTH_SHEETS = {
     1: "Styczeń",
     2: "Luty",
     3: "Marzec",
@@ -30,6 +30,21 @@ MONTH_SHEETS = {
     10: "Październik",
     11: "Listopad",
     12: "Grudzień",
+}
+
+ENGLISH_MONTH_SHEETS = {
+    1: "January",
+    2: "February",
+    3: "March",
+    4: "April",
+    5: "May",
+    6: "June",
+    7: "July",
+    8: "August",
+    9: "September",
+    10: "October",
+    11: "November",
+    12: "December",
 }
 
 REVIEW_STATUSES = ("Pending", "Approved", "Rejected", "Synced", "Conflict", "Error")
